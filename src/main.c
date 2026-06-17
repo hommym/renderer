@@ -1,11 +1,10 @@
-#include <stdio.h>
+#include "win_i_o.h"
 #include <stdlib.h>
 
 
 
 int main(){
 
-printf("Helllo World\n");  
-    
+init();   
 return   EXIT_SUCCESS;  
 }
