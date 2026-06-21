@@ -50,14 +50,9 @@ screen_hieght=(uint32_t)screen_size.h;
 return (uint32_t*) calloc((screen_hieght*screen_width),4);
 }
 
-uint32_t*  render2D(Object2d* objects,uint64_t len){
-uint32_t* frame_buffer=create_frame_buffer();
-//code impl
 
-return frame_buffer;
-}
 
-uint32_t*  render3D(Object3d* objects,uint64_t len){
+uint32_t*  render(Object* objects,uint64_t len){
 uint32_t* frame_buffer= create_frame_buffer();
 //code impl
 
