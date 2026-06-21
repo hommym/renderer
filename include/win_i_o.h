@@ -10,7 +10,7 @@
 
 extern SDL_Window* win;
 void update_win();
-void init();
-
+void create_window();
+void set_up_event_handler();
 
 #endif

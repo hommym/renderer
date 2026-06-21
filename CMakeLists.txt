@@ -9,6 +9,7 @@ find_package(SDL3 REQUIRED)
 add_executable(renderer
     src/main.c
     src/win_i_o.c
+    src/renderer.c
 )
 
 target_include_directories(renderer PRIVATE include)
