@@ -4,7 +4,7 @@
 uint32_t focal_len=24;
 uint32_t screen_width; //max column on fram_buffer
 uint32_t screen_hieght; // max row on frame_buffer
-uint32_t* frame_buffer=NULL;
+
 
 
 
@@ -38,7 +38,7 @@ static void get_screen_size(const SDL_DisplayMode* screen_size_p){
 }
 
 
-static void create_frame_buffer(){
+static uint32_t* create_frame_buffer(){
 init();    // initialising SDL subsystem in order to get screeen size
 const SDL_DisplayMode screen_size={};
 
@@ -47,18 +47,23 @@ get_screen_size(&screen_size);
 screen_width=(uint32_t)screen_size.w;
 screen_hieght=(uint32_t)screen_size.h;
 
-frame_buffer=(uint32_t*) calloc((screen_hieght*screen_width),4);
+return (uint32_t*) calloc((screen_hieght*screen_width),4);
 }
 
-void render2D(Object2d* objects,uint64_t len){
-if(frame_buffer==NULL)create_frame_buffer();
+uint32_t*  render2D(Object2d* objects,uint64_t len){
+uint32_t* frame_buffer=create_frame_buffer();
+//code impl
 
-
+return frame_buffer;
 }
 
-void render3D(Object3d* objects,uint64_t len){
-if(frame_buffer==NULL)create_frame_buffer();
+uint32_t*  render3D(Object3d* objects,uint64_t len){
+uint32_t* frame_buffer= create_frame_buffer();
+//code impl
 
+return frame_buffer;
+}
 
-
+void release_frame_buffer(uint32_t* address){
+    free(address);
 }

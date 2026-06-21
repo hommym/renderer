@@ -43,13 +43,14 @@ typedef struct Object2d
 extern uint32_t focal_len;
 extern uint32_t screen_width;
 extern uint32_t screen_hieght;
-extern uint32_t* frame_buffer; // memory representation of the screen 
 
 
 
 
-void render2D(Object2d* objects,uint64_t len);
-void render3D(Object3d* objects,uint64_t len);
+
+uint32_t* render2D(Object2d* objects,uint64_t len);
+uint32_t* render3D(Object3d* objects,uint64_t len);
+void release_frame_buffer(uint32_t* address);
 
 
 #endif
