@@ -10,6 +10,7 @@ add_executable(renderer
     src/main.c
     src/win_i_o.c
     src/renderer.c
+    src/projection.c
 )
 
 target_include_directories(renderer PRIVATE include)

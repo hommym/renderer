@@ -36,7 +36,7 @@ extern uint32_t screen_hieght;
 
 
 
-uint32_t* render(Object* objects,uint64_t len);
+uint32_t*  render(Object* objects,uint64_t len,uint32_t win_w,uint32_t win_h);
 void release_frame_buffer(uint32_t* address);
 
 

@@ -72,3 +72,12 @@ if(win==NULL){
 }
 printf("Windows Created\n");
 }
+
+void get_window_size(int* w,int* h){
+if(win!=NULL){
+SDL_GetWindowSizeInPixels(win,w,h);
+return;
+}
+printf("Failed to get window size");
+
+}

@@ -12,5 +12,5 @@ extern SDL_Window* win;
 void update_win();
 void create_window();
 void set_up_event_handler();
-
+void get_window_size(int* w,int* h);
 #endif
