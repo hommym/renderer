@@ -3,11 +3,22 @@
 #include <SDL3/SDL.h>
 
 
-// this file contains code for windows,event,input/output management 
+// this file contains code for windows,event,input/output management
 SDL_Window* win=NULL;
 static bool is_proc_running=true;
+static SDL_Renderer* sdl_renderer=NULL;
+static SDL_Texture* sdl_texture=NULL;
+static int tex_w=0;
+static int tex_h=0;
 
+void get_window_size(int* w,int* h){
+if(win!=NULL){
+SDL_GetWindowSizeInPixels(win,w,h);
+return;
+}
+printf("Failed to get window size");
 
+}
 
 void set_up_event_handler(){
 // this method will set up your event handler 
@@ -44,10 +55,38 @@ if(win==NULL){
 }
 
 
-void update_win(){
-//code for updating window screen.
+void update_win(uint32_t* frame_buffer){
+if(win==NULL){
+    printf("No window to update\n");
+    return;
+}
 
+int w,h;
+get_window_size(&w,&h);
 
+if(sdl_renderer==NULL){
+    sdl_renderer=SDL_CreateRenderer(win,NULL);
+    if(sdl_renderer==NULL){
+        printf("Renderer creation failed: %s\n",SDL_GetError());
+        abort();
+    }
+}
+
+if(sdl_texture==NULL || tex_w!=w || tex_h!=h){
+    if(sdl_texture!=NULL)SDL_DestroyTexture(sdl_texture);
+    sdl_texture=SDL_CreateTexture(sdl_renderer,SDL_PIXELFORMAT_ARGB8888,SDL_TEXTUREACCESS_STREAMING,w,h);
+    if(sdl_texture==NULL){
+        printf("Texture creation failed: %s\n",SDL_GetError());
+        abort();
+    }
+    tex_w=w;
+    tex_h=h;
+}
+
+SDL_UpdateTexture(sdl_texture,NULL,frame_buffer,w*(int)sizeof(uint32_t));
+SDL_RenderClear(sdl_renderer);
+SDL_RenderTexture(sdl_renderer,sdl_texture,NULL,NULL);
+SDL_RenderPresent(sdl_renderer);
 }
 
 void create_window(){    
@@ -73,11 +112,3 @@ if(win==NULL){
 printf("Windows Created\n");
 }
 
-void get_window_size(int* w,int* h){
-if(win!=NULL){
-SDL_GetWindowSizeInPixels(win,w,h);
-return;
-}
-printf("Failed to get window size");
-
-}

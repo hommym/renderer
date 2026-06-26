@@ -11,8 +11,9 @@ add_executable(renderer
     src/win_i_o.c
     src/renderer.c
     src/projection.c
+    src/wireframe.c
 )
 
 target_include_directories(renderer PRIVATE include)
 
-target_link_libraries(renderer PRIVATE SDL3::SDL3)
+target_link_libraries(renderer PRIVATE SDL3::SDL3 m)

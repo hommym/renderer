@@ -4,12 +4,17 @@
 #include <stdio.h>
 #include <SDL3/SDL.h>
 #include <stdlib.h>
+#include "projection.h"
+#include "wireframe.h"
 
 typedef struct Vectex
 {
-int64_t x;
-int64_t y;
-int64_t z;
+double x;
+double y;
+double z;
+uint64_t px;
+uint64_t py;
+
 } Vectex;
 
 
@@ -18,8 +23,8 @@ typedef struct Object
 {
     Vectex* vertices;
     uint64_t len_of_vertices;
-    uint64_t* wireframe;
-    uint64_t  len_of_wireframe;
+    uint64_t* connectors_sequence;
+    uint64_t  len_of_connectors;
     uint32_t colour;
 
 
@@ -36,7 +41,7 @@ extern uint32_t screen_hieght;
 
 
 
-uint32_t*  render(Object* objects,uint64_t len,uint32_t win_w,uint32_t win_h);
+void*  render(Object* objects,uint64_t len,uint32_t win_w,uint32_t win_h,bool wirefame_mode);
 void release_frame_buffer(uint32_t* address);
 
 
