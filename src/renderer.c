@@ -33,8 +33,8 @@ uint32_t (*frame_buffer)[win_w]= (uint32_t (*)[win_w]) create_frame_buffer(win_w
 for(uint64_t i=0;i<len;i++){
     for(uint64_t a=0;a<objects[i].len_of_vertices;a++){
        
-        objects[i].vertices[a].px=perspective_projection(objects[i].vertices[a].x,objects[i].vertices[a].z,focal_len,true,0,win_w);
-        objects[i].vertices[a].py=perspective_projection(objects[i].vertices[a].y,objects[i].vertices[a].z,focal_len,false,win_h,0);
+        objects[i].vertices[a].px=perspective_projection(objects[i].vertices[a].x,objects[i].vertices[a].z,focal_len,camera_position.x,camera_position.x_end);
+        objects[i].vertices[a].py=perspective_projection(objects[i].vertices[a].y,objects[i].vertices[a].z,focal_len,camera_position.y,camera_position.y_end);
         uint64_t px=objects[i].vertices[a].px;
         uint64_t py=objects[i].vertices[a].py;
         if(px<win_w && py<win_h) frame_buffer[py][px]=objects[i].colour;

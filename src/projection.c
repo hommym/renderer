@@ -4,15 +4,14 @@
 
 
 
-uint64_t perspective_projection(double xy,double z,int32_t focal,bool is_x,uint32_t win_h,uint32_t win_w){
-if(z!=0){
-xy=(xy*focal)/z;
+uint64_t perspective_projection(double xy,double z,int32_t focal,double start_p,double end_p){
+double centre     = start_p + (end_p - start_p)/2.0;   // world center
+double pix_centre = (end_p - start_p)/2.0;             // screen center pixel
+double offset     = xy - centre;
+if(z != 0){
+    offset = (offset * focal) / z;
 }
-
-if (is_x)xy+=(win_w/2);
-else xy=(win_h/2)-xy;
-
-return (uint64_t) xy;
+return (uint64_t)(pix_centre + offset);
 }
 
 
