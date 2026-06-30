@@ -4,8 +4,19 @@
 #include <stdio.h>
 #include <SDL3/SDL.h>
 #include <stdlib.h>
+#include <math.h>
 #include "projection.h"
 #include "wireframe.h"
+
+typedef struct CameraPos{
+double x; // starting positions
+double y;
+double z;
+
+double x_end;
+double y_end;
+double z_end; // far plane distance
+} CameraPos;
 
 typedef struct Vectex
 {
@@ -35,6 +46,7 @@ typedef struct Object
 extern uint32_t focal_len;
 extern uint32_t screen_width;
 extern uint32_t screen_hieght;
+extern CameraPos camera_position;
 
 
 

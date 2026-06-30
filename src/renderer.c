@@ -2,6 +2,14 @@
 uint32_t focal_len=24;
 uint32_t screen_width; //max column on fram_buffer
 uint32_t screen_hieght; // max row on frame_buffer
+CameraPos camera_position={
+0.0,
+0.0,
+0.0,
+0.0,
+0.0,
+1000.0, //default far plane distance
+};
 
 
 
