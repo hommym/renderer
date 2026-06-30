@@ -40,7 +40,36 @@ Object cube={
     .colour=0xFFFFFFFF,
 };
 
-Object scene[1]={cube};
+Vectex tri_right_vertices[3]={
+    { 200, 600, 80},
+    {1800, 600, 80},
+    {1000, 900, 80},
+};
+uint64_t tri_right_connectors[6]={0,1, 1,2, 2,0};
+Object tri_right={
+    .vertices=tri_right_vertices,
+    .len_of_vertices=3,
+    .connectors_sequence=tri_right_connectors,
+    .len_of_connectors=6,
+    .colour=0xFF00FF00,
+};
+
+Vectex bar_below_vertices[4]={
+    { 700, 300, 60},
+    { 900, 300, 60},
+    { 900,1300, 60},
+    { 700,1300, 60},
+};
+uint64_t bar_below_connectors[8]={0,1, 1,2, 2,3, 3,0};
+Object bar_below={
+    .vertices=bar_below_vertices,
+    .len_of_vertices=4,
+    .connectors_sequence=bar_below_connectors,
+    .len_of_connectors=8,
+    .colour=0xFFFFFF00,
+};
+
+Object scene[3]={cube};
 uint32_t* frame1= render(scene,1,w,h,true);
 
 update_win(frame1);
