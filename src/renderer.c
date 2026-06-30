@@ -85,7 +85,7 @@ for(size_t a=0;a<obj.len_of_connectors;a+=2){
     bresenhame_line_algo(v1.px,v1.py,v2.px,v2.py,lines_arr,lines_len);
 
     for(size_t i=0;i<lines_len;i+=2){
-        frame_buffer[lines_arr[i+1]][lines_arr[i]]=obj.colour;
+        frame_buffer[lines_arr[i+1]][lines_arr[i]]=v1.colour|v2.colour;
     }
     free(lines_arr);
 }
