@@ -6,63 +6,61 @@ The renderer paints every vertex and every edge in every Object passed to `rende
 
 ### (a) No depth buffer when writing pixels
 
-The two pixel-writing sites in `renderer.c` are unconditional with respect to depth:
+**Status: partially resolved (vertex-level).**
+
+`render()` now maintains a `v_track[py][px]` array of `Vectex*` pointers. At projection time, if a second vertex projects to a pixel already claimed by another vertex, the two are compared by `z` and the farther one has its `(px, py)` zeroed, so the wireframe culled-vertex skip drops every edge originating from it. This handles the *vertex-level* contest at any pixel.
+
+The **Bresenham pixel write** is still unconditional:
 
 ```c
-// renderer.c:30  (vertex pixels)
-if(px<win_w && py<win_h) frame_buffer[py][px] = objects[i].colour;
-
-// renderer.c:56  (wireframe pixels)
-frame_buffer[lines_arr[i+1]][lines_arr[i]] = obj.colour;
+// renderer.c (wireframe loop)
+frame_buffer[lines_arr[i+1]][lines_arr[i]] = v1.colour | v2.colour;
 ```
 
-When two edges (or vertex pixels) project to the same screen pixel, the second write wins regardless of which point is actually closer to the camera in 3D. The pixel's owner is determined by the order in which Objects, vertices, and edges happen to be iterated — not by their depth. As soon as a model has any front/back overlap in screen space, which edge owns a contested pixel becomes essentially arbitrary.
+When two edges cross in screen space and neither endpoint is the contested pixel, the second write still wins regardless of depth. Making the depth test usable along the line requires the rasterizer itself to be extended:
 
-Adding a depth buffer is not just an allocation. To make the depth test usable for the wireframe path, the rasterizer itself has to be extended:
-
-- `Vectex` (or the projection output) must retain a camera-space `z` per vertex. Today `perspective_projection` consumes `z` and only writes back `(px, py)`; the `z` value at the line endpoints is then unavailable downstream.
-- `bresenhame_line_algo` must interpolate `z` along the line, the same way it currently interpolates the minor axis (`y` in the x-major branch, `x` in the y-major branch). One extra accumulator stepping `(z2 - z1) / steps` per iteration.
+- `Vectex` already retains `z`, but `bresenhame_line_algo` currently sees only `(px, py)` at the endpoints. The endpoints' `z` values need to reach it.
+- The Bresenham loop must interpolate `z` along the line the same way it interpolates the minor axis (`y` in the x-major branch, `x` in the y-major branch). One extra accumulator stepping `(z2 - z1) / steps` per iteration.
 - The pixel write becomes a 3-step compare-write-update against `depth_buffer[py][px]`: read the stored depth, compare with the new pixel's interpolated `z`, write the color and the new `z` only if it's closer.
 
 The same per-pixel `z` machinery is the foundation that filled-triangle rasterization will later need — so the work here is not throw-away.
 
 ### (b) Wasted projection work on non-visible vertices
 
-The projection loop (`renderer.c:25-32`) runs `perspective_projection` for every vertex of every Object, with no test for whether the vertex is:
+**Status: resolved.**
 
-- behind the camera (`z <= 0`),
-- beyond some far cutoff,
-- so far to the side of the camera that its screen pixel would land outside the window.
+The projection loop now performs an in-view check before calling `perspective_projection`:
 
-For tiny scenes this is irrelevant. For the LAS cloud at ~500k vertices and the GLB tree at ~510k vertices, a meaningful fraction of the per-frame work is spent computing pixel coordinates for points we already could have known would never be displayed.
+```c
+bool is_x_in_view = point.x >= camera_position.x && point.x <= camera_position.x_end;
+bool is_y_in_view = point.y >= camera_position.y && point.y <= camera_position.y_end;
+bool is_z_in_view = point.z >= camera_position.z && point.z <= camera_position.z_end;
+if(!(is_x_in_view && is_y_in_view && is_z_in_view)) continue;
+```
+
+Vertices behind the camera (`z < camera_position.z`), beyond the far plane (`z > camera_position.z_end`), or outside the lateral frustum walls skip the projection step entirely.
 
 ### (c) Hidden line / hidden surface removal for the wireframe
 
-Edges on the *far* side of a closed mesh are drawn the same way as edges on the *near* side. Where two edges overlap in screen space, sub-issue (a) arbitrates which one is visible by iteration order. Where a far edge does NOT overlap a near edge, the far edge simply shows through, and the model looks like spaghetti instead of an outline. This is what produced the dense, "filled" appearance of the gnarled-tree GLB model before the dihedral edge-filtering pass — many of the kept edges were structurally on the back side of the trunk and canopy and should never have been visible from the camera.
+Edges on the *far* side of a closed mesh are drawn the same way as edges on the *near* side. Where two edges overlap in screen space, sub-issue (a) arbitrates which one is visible (now per-vertex; later per-pixel). Where a far edge does NOT overlap a near edge, the far edge simply shows through, and the model looks like spaghetti instead of an outline. This is what produced the dense, "filled" appearance of the gnarled-tree GLB model before the dihedral edge-filtering pass — many of the kept edges were structurally on the back side of the trunk and canopy and should never have been visible from the camera.
 
-Conceptually this is related to (a) but stronger: even if a depth buffer fixed per-pixel correctness, the wireframe path still rasterizes every edge first. Correctness applies only at contested pixels; sparse far-side edges still leak through everywhere they don't overlap a near edge.
+Conceptually this is related to (a) but stronger: even when the depth buffer fixes per-pixel correctness, the wireframe path still rasterizes every edge first. Correctness applies only at contested pixels; sparse far-side edges still leak through everywhere they don't overlap a near edge.
 
 ---
 
 ## Issue 2: camera rotation vs object rotation
 
-There is no camera abstraction in the renderer. `perspective_projection` is called with raw world coordinates:
+A `CameraPos` struct exists (`renderer.h`) and `perspective_projection` now centers its output around `start_p`/`end_p` derived from `camera_position`. Shifting `camera_position.x`/`x_end` therefore shifts what counts as "screen center" along that axis. But this only changes the *projection center*; world points are still consumed by the projection as-is. Specifically:
 
-```c
-// renderer.c:28-29
-objects[i].vertices[a].px = perspective_projection(
-    objects[i].vertices[a].x, objects[i].vertices[a].z,
-    focal_len, true, 0, win_w);
-```
-
-The implicit camera is fixed at `(0, 0, 0)`, facing `+z`, with `+y` up. Nothing in the data structures or function signatures represents the camera's position or orientation; there is no mechanism to move it.
+- World coordinates are never multiplied through a camera rotation matrix.
+- World coordinates are never offset by a camera position vector before projection — `camera_position` is used as frustum culling bounds and as the projection center reference, not as the camera's world location subtracted from each vertex.
 
 "Rotating the object" currently means mutating that Object's `vertices` array in place — the model literally moves in the world. This conflates two distinct concepts:
 
 - **Object rotation**: a single Object's pose in the world changes. Different Objects can be rotated independently. Camera unchanged.
 - **Camera rotation**: the camera turns. All Objects stay where they are in world coordinates, but they appear to rotate the opposite way relative to the camera.
 
-The renderer cannot express the second concept at all. There is no view transform between a vertex's world coordinates and the projection step. To make the camera rotate or move, every world point would need to be transformed into camera space first; right now there is nowhere for that transform to live.
+The renderer cannot express the second concept at all. To make the camera rotate or translate, every world point would need to be transformed into camera space first; there is still nowhere for that transform to live.
 
 ---
 
@@ -70,20 +68,8 @@ The renderer cannot express the second concept at all. There is no view transfor
 
 ### Near-plane clipping in `perspective_projection`
 
-The projection function (`projection.c:7`) only guards against exact zero in z:
-
-```c
-uint64_t perspective_projection(double xy, double z, int32_t focal, bool is_x, uint32_t win_h, uint32_t win_w){
-    if(z != 0){
-        xy = (xy * focal) / z;
-    }
-    ...
-}
-```
-
-A vertex at `z = 0.1` produces a projected coordinate of `xy * focal * 10` — an order-of-magnitude blowup. A vertex with negative `z` (behind the camera) flips the projection's sign and lands on the opposite side of the screen, with no flag that anything went wrong. There is no "near plane" cutoff; the GLB and LAS loaders had to be tuned to keep every vertex at `z > ~200` because anything closer produced visual chaos or out-of-bounds writes.
+**Status: partially resolved.** Vertices with `z < camera_position.z` (default `0`) are now culled before reaching the projection, so negative-z (behind-camera) vertices no longer sign-flip the output. However, a vertex at `z = 0.1` still produces a projected offset of `(xy - centre) * focal * 10` — an order-of-magnitude blowup — because the in-view floor is `0`, not a finite near plane. The GLB and LAS loaders still have to keep every vertex at `z` well above zero to avoid visual chaos.
 
 ### Edge clipping at window borders
 
-The vertex pixel write (`renderer.c:30`) has a per-pixel bounds check; the wireframe pixel write (`renderer.c:56`) does not. An edge whose endpoints are both inside the window is safe, but an edge with one endpoint inside and one outside is not: Bresenham walks from the inside endpoint toward the outside one and writes into out-of-bounds memory along the way. The line itself is never clipped against the window rectangle before rasterization.
-
+The wireframe pixel write does not bounds-check `px`/`py` against the framebuffer dimensions. In the current setup this is partially shielded by two things: the in-view check rejects vertices outside the frustum, and the new projection — where world `[start_p, end_p]` maps to screen `[0, win]` at `z = focal_len` — keeps in-view vertices on-screen for `z >= focal_len`. But for `z < focal_len` the projection magnifies points outside the visible window, and writes to `frame_buffer[py][px]` past `win_w` quietly wrap into the next row (or, with large enough overflow, out of the allocated buffer entirely). The line itself is still never clipped against the window rectangle before rasterization.
