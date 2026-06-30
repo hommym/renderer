@@ -38,6 +38,7 @@ static void calc_screen_cordinate(double win_size,double start_cord,double* end_
 
 void * render(Object* objects,uint64_t len,uint32_t win_w,uint32_t win_h,bool wirefame_mode){
 uint32_t (*frame_buffer)[win_w]= (uint32_t (*)[win_w]) create_frame_buffer(win_w,win_h);
+Vectex*  (*v_track)[win_w]=(Vectex* (*)[win_w])calloc(win_h*win_w,sizeof(Vectex*));
 calc_screen_cordinate(win_w,camera_position.x,&(camera_position.x_end));
 calc_screen_cordinate(win_h,camera_position.y,&(camera_position.y_end));
 
@@ -55,17 +56,31 @@ for(uint64_t i=0;i<len;i++){
 
         
 
-        objects[i].vertices[a].px=perspective_projection(objects[i].vertices[a].x,objects[i].vertices[a].z,focal_len,camera_position.x,camera_position.x_end);
-        objects[i].vertices[a].py=perspective_projection(objects[i].vertices[a].y,objects[i].vertices[a].z,focal_len,camera_position.y,camera_position.y_end);
-        uint64_t px=objects[i].vertices[a].px;
-        uint64_t py=objects[i].vertices[a].py;
-        // frame_buffer[py][px]=objects[i].colour;
+        uint64_t px=perspective_projection(objects[i].vertices[a].x,objects[i].vertices[a].z,focal_len,camera_position.x,camera_position.x_end);
+        uint64_t py=perspective_projection(objects[i].vertices[a].y,objects[i].vertices[a].z,focal_len,camera_position.y,camera_position.y_end);
+
+        if(v_track[py][px]!=0){
+         // chceking projection on the same pixel point to see which one is closer   
+         Vectex point0=*(v_track[py][px]);    
+        
+         if(point0.z>point.z){
+            (*(v_track[py][px])).px=0;
+            (*(v_track[py][px])).py=0;
+         }
+         else continue;
+        }
+        
+        objects[i].vertices[a].px=px;
+        objects[i].vertices[a].py=py;
+        v_track[py][px]=objects[i].vertices+a;
+        
     }
     
 
 
 }
 
+free(v_track);
 if(wirefame_mode){
 for(size_t x=0;x<len;x++){
 Object obj=objects[x];
@@ -95,7 +110,6 @@ for(size_t a=0;a<obj.len_of_connectors;a+=2){
 
 }
 //code impl
-
 return frame_buffer;
 }
 
