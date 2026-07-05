@@ -1,5 +1,5 @@
 #include "renderer.h"
-uint32_t focal_len=400;
+uint32_t focal_len=600;
 uint32_t screen_width; //max column on fram_buffer
 uint32_t screen_hieght; // max row on frame_buffer
 static CameraPos camera_position={
@@ -52,7 +52,6 @@ void render_init(Object* objs,uint64_t len,uint32_t win_w,uint32_t win_h,bool wi
 // needs to be called once to initialise the who renderer
 if(is_init_called) return;   
 create_frame_buffer(win_w,win_h);    
-Vectex (*frame_buffer)[win_w]= (Vectex (*)[win_w])frame;
 objects=objs;
 objects_len=len;
 screen_width=win_w;
