@@ -161,10 +161,11 @@ if(pixel_buffer==NULL || pb_w!=w || pb_h!=h){
 }
 
 // flatten the Vectex grid into ARGB pixels for SDL.
-// empty cells are zeroed by calloc, so their .colour is 0 (black).
+// empty cells (never written by render()) paint as white background;
+// occupied cells (.in_use==true) paint with their own .colour.
 size_t total=(size_t)w*(size_t)h;
 for(size_t i=0;i<total;i++){
-    pixel_buffer[i]=frame_buffer[i].colour;
+    pixel_buffer[i]=frame_buffer[i].in_use ? frame_buffer[i].colour : 0xFFFFFFFF;
 }
 
 SDL_UpdateTexture(sdl_texture,NULL,pixel_buffer,w*(int)sizeof(uint32_t));
