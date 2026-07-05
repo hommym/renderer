@@ -1,8 +1,8 @@
 #include "renderer.h"
-uint32_t focal_len=24;
+uint32_t focal_len=600;
 uint32_t screen_width; //max column on fram_buffer
 uint32_t screen_hieght; // max row on frame_buffer
-CameraPos camera_position={
+static CameraPos camera_position={
 0.0,
 0.0,
 0.0,
@@ -11,15 +11,18 @@ CameraPos camera_position={
 1000.0, //default far plane distance
 };
 
+static bool is_init_called=false;
+Object* objects;
+static size_t objects_len;
+void* frame;
 
 
 
 
 
 
-
-static void* create_frame_buffer(uint32_t win_w,uint32_t win_h){
-return calloc((win_h*win_w),4);
+static void create_frame_buffer(uint32_t win_w,uint32_t win_h){
+frame= calloc((win_h*win_w),sizeof(Vectex));
 }
 
 static void calc_screen_cordinate(double win_size,double start_cord,double* end_cord_p){
@@ -35,72 +38,93 @@ static void calc_screen_cordinate(double win_size,double start_cord,double* end_
 
 }
 
+static bool is_vectex_visible(Vectex point){
+bool is_x_in_view=point.x>=camera_position.x && point.x<=camera_position.x_end;
+bool is_y_in_view=point.y>=camera_position.y && point.y<=camera_position.y_end;
+bool is_z_in_view=point.z>=camera_position.z && point.z<=camera_position.z_end;
 
-void * render(Object* objects,uint64_t len,uint32_t win_w,uint32_t win_h,bool wirefame_mode){
-uint32_t (*frame_buffer)[win_w]= (uint32_t (*)[win_w]) create_frame_buffer(win_w,win_h);
-Vectex*  (*v_track)[win_w]=(Vectex* (*)[win_w])calloc(win_h*win_w,sizeof(Vectex*));
-calc_screen_cordinate(win_w,camera_position.x,&(camera_position.x_end));
-calc_screen_cordinate(win_h,camera_position.y,&(camera_position.y_end));
+if(is_x_in_view && is_y_in_view && is_z_in_view) return true;
 
-
-
-// project 3D points to 2D
-for(uint64_t i=0;i<len;i++){
-    for(uint64_t a=0;a<objects[i].len_of_vertices;a++){
-       Vectex point=objects[i].vertices[a];
-       bool is_x_in_view=point.x>=camera_position.x && point.x<=camera_position.x_end;
-       bool is_y_in_view=point.y>=camera_position.y && point.y<=camera_position.y_end;
-       bool is_z_in_view=point.z>=camera_position.z && point.z<=camera_position.z_end;
-
-       if(!(is_x_in_view && is_y_in_view && is_z_in_view))continue; 
-
-        
-
-        uint64_t px=perspective_projection(objects[i].vertices[a].x,objects[i].vertices[a].z,focal_len,camera_position.x,camera_position.x_end);
-        uint64_t py=perspective_projection(objects[i].vertices[a].y,objects[i].vertices[a].z,focal_len,camera_position.y,camera_position.y_end);
-
-        if(v_track[py][px]!=0){
-         // chceking projection on the same pixel point to see which one is closer   
-         Vectex point0=*(v_track[py][px]);    
-        
-         if(point0.z>point.z){
-            (*(v_track[py][px])).px=0;
-            (*(v_track[py][px])).py=0;
-         }
-         else continue;
-        }
-        
-        objects[i].vertices[a].px=px;
-        objects[i].vertices[a].py=py;
-        v_track[py][px]=objects[i].vertices+a;
-        
-    }
-    
-
-
+return false;
 }
 
-free(v_track);
+void render_init(Object* objs,uint64_t len,uint32_t win_w,uint32_t win_h,bool wirefame_mode){
+// needs to be called once to initialise the who renderer
+if(is_init_called) return;   
+create_frame_buffer(win_w,win_h);    
+Vectex (*frame_buffer)[win_w]= (Vectex (*)[win_w])frame;
+objects=objs;
+objects_len=len;
+screen_width=win_w;
+screen_hieght=win_h;
+calc_screen_cordinate(win_w,camera_position.x,&(camera_position.x_end));
+calc_screen_cordinate(win_h,camera_position.y,&(camera_position.y_end));
+is_init_called=true;
+}
+
+
+bool render(bool wirefame_mode){
+
+if(!is_init_called){
+ printf("Warning: render_init was never executed and is required for render func");
+ return false;   
+}
+
+Vectex (*frame_buffer)[screen_width]= (Vectex (*)[screen_width])frame;   
+
 if(wirefame_mode){
-for(size_t x=0;x<len;x++){
+for(size_t x=0;x<objects_len;x++){
 Object obj=objects[x];
+
+// point-cloud path: no connectors -> paint each visible vertex as one pixel
+if(obj.len_of_connectors==0){
+    for(size_t v=0;v<obj.len_of_vertices;v++){
+        Vectex pt=obj.vertices[v];
+        if(!is_vectex_visible(pt)) continue;
+        pt.px=perspective_projection(pt.x,pt.z,focal_len,camera_position.x,camera_position.x_end);
+        pt.py=perspective_projection(pt.y,pt.z,focal_len,camera_position.y,camera_position.y_end);
+        if(!(pt.py<screen_hieght && pt.px<screen_width)) continue;
+        Vectex point0=frame_buffer[pt.py][pt.px];
+        if(point0.in_use && point0.z<pt.z) continue;
+        pt.in_use=true;
+        frame_buffer[pt.py][pt.px]=pt;
+    }
+    continue;
+}
 
 for(size_t a=0;a<obj.len_of_connectors;a+=2){
     Vectex v1=obj.vertices[obj.connectors_sequence[a]];
     Vectex v2=obj.vertices[obj.connectors_sequence[a+1]];
-    if((v1.px==0 && v1.py==0) || (v2.px==0 && v2.py==0))continue;
-    int64_t ch_x=v1.px-v2.px;
-    int64_t ch_y=v1.py-v2.py;
-  
+    
+    if(!(is_vectex_visible(v1) || is_vectex_visible(v2)))continue;
 
+    v1.px=perspective_projection(v1.x,v1.z,focal_len,camera_position.x,camera_position.x_end);
+    v1.py=perspective_projection(v1.y,v1.z,focal_len,camera_position.y,camera_position.y_end);
+
+
+    v2.px=perspective_projection(v2.x,v2.z,focal_len,camera_position.x,camera_position.x_end);
+    v2.py=perspective_projection(v2.y,v2.z,focal_len,camera_position.y,camera_position.y_end);
+
+    int64_t ch_x= v1.px-v2.px;
+    int64_t ch_y= v1.py-v2.py;
+  
     if(ch_x<0)ch_x*=-1;
     if(ch_y<0)ch_y*=-1;
-    size_t lines_len=ch_x>=ch_y?((ch_x+1)*2):((ch_y+1)*2);
-    uint64_t* lines_arr=calloc(lines_len,sizeof(uint64_t)); // an array for storing the pixel cordinates to be coloured
-    bresenhame_line_algo(v1.px,v1.py,v2.px,v2.py,lines_arr,lines_len);
 
-    for(size_t i=0;i<lines_len;i+=2){
-        frame_buffer[lines_arr[i+1]][lines_arr[i]]=v1.colour|v2.colour;
+    size_t lines_len=ch_x>=ch_y?(ch_x+1):(ch_y+1);
+    // if(lines_len==1)continue;
+    Vectex* lines_arr=calloc(lines_len,sizeof(Vectex)); // an array for storing vectex pointer to be coloured to form the line
+    bresenhame_line_algo(v1.px,v1.py,v2.px,v2.py,v1.z,v2.z,lines_arr);
+
+
+    for(size_t i=0;i<lines_len;i++){
+        Vectex point=lines_arr[i];
+        Vectex point0= point.py<screen_hieght && point.px<screen_width? frame_buffer[point.py][point.px]:(Vectex){0.0};
+
+        if(point0.in_use && point0.z<point.z) continue;
+
+        point.colour=v1.colour | v2.colour;
+        if(point.py<screen_hieght && point.px<screen_width)frame_buffer[point.py][point.px]=point;
     }
     free(lines_arr);
 }
@@ -109,10 +133,49 @@ for(size_t a=0;a<obj.len_of_connectors;a+=2){
 
 
 }
-//code impl
-return frame_buffer;
+
+else{
+// rasterization
 }
 
-void release_frame_buffer(uint32_t* address){
+
+return true;
+}
+
+void clear_frame_buffer(void* address){
     free(address);
+    if(screen_hieght!=0 && screen_width!=0)create_frame_buffer(screen_width,screen_hieght);
+    else frame=NULL;
+}
+
+void move_camera(double unit,Movement direction){
+    switch (direction)
+    {
+    case MOV_LEFT:
+        camera_position.x-=unit;
+        camera_position.x_end-=unit;
+        break;
+    case MOV_RIGHT:
+        camera_position.x+=unit;
+        camera_position.x_end+=unit;
+        break;
+    case MOV_UP:
+        camera_position.y+=unit;
+        camera_position.y_end+=unit;
+        break;
+    case MOV_DOWN:
+        camera_position.y-=unit;
+        camera_position.y_end-=unit;
+        break;
+    case MOV_FORWARD:
+        camera_position.z+=unit;
+        camera_position.z_end+=unit;
+        break;
+    default:
+        //backewards
+        camera_position.z-=unit;
+        camera_position.z_end-=unit;
+        break;
+    }
+
 }
