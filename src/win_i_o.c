@@ -1,6 +1,7 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include <SDL3/SDL.h>
+#include "renderer.h"
 
 
 // this file contains code for windows,event,input/output management
@@ -10,6 +11,9 @@ static SDL_Renderer* sdl_renderer=NULL;
 static SDL_Texture* sdl_texture=NULL;
 static int tex_w=0;
 static int tex_h=0;
+static uint32_t* pixel_buffer=NULL;
+static int pb_w=0;
+static int pb_h=0;
 
 void get_window_size(int* w,int* h){
 if(win!=NULL){
@@ -55,7 +59,7 @@ if(win==NULL){
 }
 
 
-void update_win(uint32_t* frame_buffer){
+void update_win(Vectex* frame_buffer){
 if(win==NULL){
     printf("No window to update\n");
     return;
@@ -83,7 +87,25 @@ if(sdl_texture==NULL || tex_w!=w || tex_h!=h){
     tex_h=h;
 }
 
-SDL_UpdateTexture(sdl_texture,NULL,frame_buffer,w*(int)sizeof(uint32_t));
+if(pixel_buffer==NULL || pb_w!=w || pb_h!=h){
+    free(pixel_buffer);
+    pixel_buffer=(uint32_t*)malloc((size_t)w*(size_t)h*sizeof(uint32_t));
+    if(pixel_buffer==NULL){
+        printf("Pixel buffer allocation failed\n");
+        abort();
+    }
+    pb_w=w;
+    pb_h=h;
+}
+
+// flatten the Vectex grid into ARGB pixels for SDL.
+// empty cells are zeroed by calloc, so their .colour is 0 (black).
+size_t total=(size_t)w*(size_t)h;
+for(size_t i=0;i<total;i++){
+    pixel_buffer[i]=frame_buffer[i].colour;
+}
+
+SDL_UpdateTexture(sdl_texture,NULL,pixel_buffer,w*(int)sizeof(uint32_t));
 SDL_RenderClear(sdl_renderer);
 SDL_RenderTexture(sdl_renderer,sdl_texture,NULL,NULL);
 SDL_RenderPresent(sdl_renderer);
