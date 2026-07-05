@@ -1,29 +1,30 @@
 #include "renderer.h"
 #include "win_i_o.h"
-// #include "model_data.h"
+#include "model_data.h"
+#include "point_cloud_data.h"
 
 int main(){
 create_window();
 int w,h;
 get_window_size(&w,&h);
 
-// Object model={
-//     .vertices=model_vertices,
-//     .len_of_vertices=MODEL_VERT_COUNT,
-//     .connectors_sequence=model_connectors,
-//     .len_of_connectors=MODEL_CONNECTOR_COUNT,
-//     .colour=0xFFFFFFFF,
-// };
+Object model={
+    .vertices=model_vertices,
+    .len_of_vertices=MODEL_VERT_COUNT,
+    .connectors_sequence=model_connectors,
+    .len_of_connectors=MODEL_CONNECTOR_COUNT,
+    .colour=0xFFFFFFFF,
+};
 
 Vectex cube_vertices[8]={
-    { 100, 100, 50, 0, 0, 0xFFFFFFFF},
-    {1400, 100, 50, 0, 0, 0xFFFFFFFF},
-    {1400, 900, 50, 0, 0, 0xFFFFFFFF},
-    { 100, 900, 50, 0, 0, 0xFFFFFFFF},
-    { 100, 100,100, 0, 0, 0xFFFFFFFF},
-    {1400, 100,100, 0, 0, 0xFFFFFFFF},
-    {1400, 900,100, 0, 0, 0xFFFFFFFF},
-    { 100, 900,100, 0, 0, 0xFFFFFFFF},
+    {.x= 100,.y=100,.z= 50,.colour=0xFFFFFFFF},
+    {.x=1400,.y=100,.z= 50,.colour=0xFFFFFFFF},
+    {.x=1400,.y=900,.z= 50,.colour=0xFFFFFFFF},
+    {.x= 100,.y=900,.z= 50,.colour=0xFFFFFFFF},
+    {.x= 100,.y=100,.z=100,.colour=0xFFFFFFFF},
+    {.x=1400,.y=100,.z=100,.colour=0xFFFFFFFF},
+    {.x=1400,.y=900,.z=100,.colour=0xFFFFFFFF},
+    {.x= 100,.y=900,.z=100,.colour=0xFFFFFFFF},
 };
 
 uint64_t cube_connectors[24]={
@@ -40,9 +41,9 @@ Object cube={
 };
 
 Vectex tri_right_vertices[3]={
-    { 200, 600, 80, 0, 0, 0xFF00FF00},
-    {1800, 600, 80, 0, 0, 0xFF00FF00},
-    {1000, 900, 80, 0, 0, 0xFF00FF00},
+    {.x= 200,.y=600,.z=80,.colour=0xFF00FF00},
+    {.x=1800,.y=600,.z=80,.colour=0xFF00FF00},
+    {.x=1000,.y=900,.z=80,.colour=0xFF00FF00},
 };
 uint64_t tri_right_connectors[6]={0,1, 1,2, 2,0};
 Object tri_right={
@@ -53,10 +54,10 @@ Object tri_right={
 };
 
 Vectex bar_below_vertices[4]={
-    { 700, 300, 60, 0, 0, 0xFFFFFF00},
-    { 900, 300, 60, 0, 0, 0xFFFFFF00},
-    { 900,1300, 60, 0, 0, 0xFFFFFF00},
-    { 700,1300, 60, 0, 0, 0xFFFFFF00},
+    {.x=700,.y= 300,.z=60,.colour=0xFFFFFF00},
+    {.x=900,.y= 300,.z=60,.colour=0xFFFFFF00},
+    {.x=900,.y=1300,.z=60,.colour=0xFFFFFF00},
+    {.x=700,.y=1300,.z=60,.colour=0xFFFFFF00},
 };
 uint64_t bar_below_connectors[8]={0,1, 1,2, 2,3, 3,0};
 Object bar_below={
@@ -66,12 +67,39 @@ Object bar_below={
     .len_of_connectors=8,
 };
 
-Object scene[3]={cube};
-uint32_t* frame1= render(scene,1,w,h,true);
+// partial_view: rectangle straddling the right window border.
+// left edge in-view; right edge (world x=2500) is outside the frustum
+// (x_end=1500) AND projects past the screen right edge (px~1590 at z=50).
+// Expect: cyan rectangle with the right side clipped off.
+Vectex partial_view_vertices[4]={
+    {.x=1200,.y=400,.z=50,.colour=0xFF00FFFF},
+    {.x=2500,.y=400,.z=50,.colour=0xFF00FFFF},
+    {.x=2500,.y=800,.z=50,.colour=0xFF00FFFF},
+    {.x=1200,.y=800,.z=50,.colour=0xFF00FFFF},
+};
+uint64_t partial_view_connectors[8]={0,1, 1,2, 2,3, 3,0};
+Object partial_view={
+    .vertices=partial_view_vertices,
+    .len_of_vertices=4,
+    .connectors_sequence=partial_view_connectors,
+    .len_of_connectors=8,
+};
 
-update_win(frame1);
+Object tree_pointcloud={
+    .vertices=point_cloud_vertices,
+    .len_of_vertices=POINTCLOUD_VERT_COUNT,
+    .connectors_sequence=point_cloud_connectors,
+    .len_of_connectors=POINTCLOUD_CONNECTOR_COUNT,   // 0 -> point-cloud mode in render()
+    .colour=0xFF00FF00,
+};
+
+Object scene[4]={model,tree_pointcloud};
+render_init(scene,2,w,h,true);
+render(true);
+
+update_win((Vectex*)frame);
 
 set_up_event_handler();
-release_frame_buffer(frame1);
+clear_frame_buffer(frame);
 return   EXIT_SUCCESS;
 }
