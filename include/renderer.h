@@ -66,7 +66,8 @@ extern void* frame;
 
 void  render_init(Object* objs,uint64_t len,uint32_t win_w,uint32_t win_h,bool wirefame_mode);
 bool  render(bool wirefame_mode);
-void clear_frame_buffer(void* address);
+void clear_frame_buffer();
+void renderer_resize(uint32_t win_w,uint32_t win_h);
 void move_camera(double unit,Movement direction);
 
 #endif

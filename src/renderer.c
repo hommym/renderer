@@ -142,10 +142,22 @@ else{
 return true;
 }
 
-void clear_frame_buffer(void* address){
-    free(address);
+void clear_frame_buffer(){
+    free(frame);
     if(screen_hieght!=0 && screen_width!=0)create_frame_buffer(screen_width,screen_hieght);
     else frame=NULL;
+}
+
+void renderer_resize(uint32_t win_w,uint32_t win_h){
+    // if(!is_init_called) return;
+    screen_width=win_w;
+    screen_hieght=win_h;
+    // recompute frustum bounds from camera + new window size.
+    // this bypasses calc_screen_cordinate's accumulator, so repeated
+    // resizes stay correct.
+    camera_position.x_end=camera_position.x+win_w;
+    camera_position.y_end=camera_position.y+win_h;
+    create_frame_buffer(win_w,win_h);
 }
 
 void move_camera(double unit,Movement direction){
@@ -177,5 +189,8 @@ void move_camera(double unit,Movement direction){
         camera_position.z_end-=unit;
         break;
     }
+
+    // clear frame buffer
+    clear_frame_buffer();
 
 }
