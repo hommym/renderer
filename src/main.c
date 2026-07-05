@@ -97,9 +97,8 @@ Object scene[4]={model,tree_pointcloud};
 render_init(scene,2,w,h,true);
 render(true);
 
-update_win((Vectex*)frame);
+// update_win((Vectex*)frame);
 
 set_up_event_handler();
-clear_frame_buffer(frame);
 return   EXIT_SUCCESS;
 }

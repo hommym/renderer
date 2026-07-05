@@ -2,7 +2,7 @@
 #include <stdio.h>
 #include <SDL3/SDL.h>
 #include "renderer.h"
-
+#include "win_i_o.h"
 
 // this file contains code for windows,event,input/output management
 SDL_Window* win=NULL;
@@ -44,14 +44,76 @@ if(win==NULL){
                 is_proc_running=false;
                 printf("Window destroyed\n");
                 break;
+            case SDL_EVENT_WINDOW_RESIZED:
+            case SDL_EVENT_WINDOW_MAXIMIZED:
+            case SDL_EVENT_WINDOW_RESTORED:
+                {
+                    // MAXIMIZED / RESTORED don't carry the new dims in data1/data2,
+                    // and pixel size on HiDPI can differ from logical size, so ask
+                    // SDL for the actual pixel size after the state change.
+                    int nw, nh;
+                    get_window_size(&nw, &nh);
+                    printf("Window size changed to %dx%d\n", nw, nh);
+                    renderer_resize((uint32_t)nw, (uint32_t)nh);
+                    render(true);
+                }
+                break;
             case SDL_EVENT_MOUSE_MOTION:
                 printf("Mouse is moving\n");
                 break;
             case SDL_EVENT_MOUSE_BUTTON_DOWN:
                 printf("Mouse button pressed\n");
-                break;    
+                break;
+            case SDL_EVENT_MOUSE_WHEEL:
+                // event.wheel.y > 0 -> scroll up / away from user  -> forward
+                // event.wheel.y < 0 -> scroll down / toward user   -> backward
+                if(event.wheel.y > 0){
+                    printf("Scroll up (forward)\n");
+                    move_camera(10,MOV_FORWARD);
+                    render(true);
+                }
+                else if(event.wheel.y < 0){
+                    printf("Scroll down (backward)\n");
+                    move_camera(10,MOV_BACKWARD);
+                    render(true);
+                }
+                break;
+            case SDL_EVENT_KEY_DOWN:
+                // for handling arrow keys press
+                if(!event.key.repeat){
+                       switch (event.key.key)
+                {
+                case SDLK_LEFT:
+                    // call your camera / scene handler for LEFT here
+                    printf("Left Arrow key pressed\n");
+                    move_camera(5,MOV_LEFT);
+                    render(true);
+                    break;
+                case SDLK_RIGHT:
+                    // call your camera / scene handler for RIGHT here
+                    printf("Right Arrow key pressed\n");
+                    move_camera(5,MOV_RIGHT);
+                    render(true);
+                    break;
+                case SDLK_UP:
+                    // call your camera / scene handler for UP here
+                    printf("Up Arrow key pressed\n");
+                    move_camera(5,MOV_UP);
+                    render(true);
+                    break;
+                case SDLK_DOWN:
+                    // call your camera / scene handler for DOWN here
+                    printf("Down Arrow key pressed\n");
+                    move_camera(5,MOV_DOWN);
+                    render(true);
+                    break;
+                }
+             
+                }
+                break;
             }
 
+            update_win(frame);
         }
         
     }
