@@ -11,9 +11,8 @@ static CameraPos camera_position={
 1000.0, //default far plane distance
 };
 
-static bool is_init_called=false;
 Object* objects;
-static size_t objects_len;
+static size_t objects_len=0;
 void* frame;
 
 
@@ -25,16 +24,8 @@ static void create_frame_buffer(uint32_t win_w,uint32_t win_h){
 frame= calloc((win_h*win_w),sizeof(Vectex));
 }
 
-static void calc_screen_cordinate(double win_size,double start_cord,double* end_cord_p){
-    // calculates x or y cordinate values for the screen in world space(ie 3D)
-    double diff=start_cord-(*end_cord_p);
-    if(diff>win_size){
-    *end_cord_p-=fabs(diff-win_size);
-    }
-    else if(diff<win_size){
-    *end_cord_p+=fabs(diff-win_size);
-    }
-    else *end_cord_p=diff+start_cord;
+static void calc_screen_end_cordinate(double win_size,double start_cord,double* end_cord_p){
+    *end_cord_p=start_cord+win_size;
 
 }
 
@@ -49,25 +40,18 @@ return false;
 }
 
 void render_init(Object* objs,uint64_t len,uint32_t win_w,uint32_t win_h,bool wirefame_mode){
-// needs to be called once to initialise the who renderer
-if(is_init_called) return;   
+// needs to be called once to initialise the who renderer  
 create_frame_buffer(win_w,win_h);    
 objects=objs;
 objects_len=len;
 screen_width=win_w;
 screen_hieght=win_h;
-calc_screen_cordinate(win_w,camera_position.x,&(camera_position.x_end));
-calc_screen_cordinate(win_h,camera_position.y,&(camera_position.y_end));
-is_init_called=true;
+calc_screen_end_cordinate(win_w,camera_position.x,&(camera_position.x_end));
+calc_screen_end_cordinate(win_h,camera_position.y,&(camera_position.y_end));
 }
 
 
 bool render(bool wirefame_mode){
-
-if(!is_init_called){
- printf("Warning: render_init was never executed and is required for render func");
- return false;   
-}
 
 Vectex (*frame_buffer)[screen_width]= (Vectex (*)[screen_width])frame;   
 
@@ -75,7 +59,7 @@ if(wirefame_mode){
 for(size_t x=0;x<objects_len;x++){
 Object obj=objects[x];
 
-// point-cloud path: no connectors -> paint each visible vertex as one pixel
+// no connectors -> paint each visible vertex as one pixel
 if(obj.len_of_connectors==0){
     for(size_t v=0;v<obj.len_of_vertices;v++){
         Vectex pt=obj.vertices[v];
@@ -148,14 +132,10 @@ void clear_frame_buffer(){
 }
 
 void renderer_resize(uint32_t win_w,uint32_t win_h){
-    // if(!is_init_called) return;
     screen_width=win_w;
     screen_hieght=win_h;
-    // recompute frustum bounds from camera + new window size.
-    // this bypasses calc_screen_cordinate's accumulator, so repeated
-    // resizes stay correct.
-    camera_position.x_end=camera_position.x+win_w;
-    camera_position.y_end=camera_position.y+win_h;
+    calc_screen_end_cordinate(win_w,camera_position.x,&(camera_position.x_end));
+    calc_screen_end_cordinate(win_h,camera_position.y,&(camera_position.y_end));
     create_frame_buffer(win_w,win_h);
 }
 
