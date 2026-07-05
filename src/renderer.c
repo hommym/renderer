@@ -112,7 +112,7 @@ for(size_t a=0;a<obj.len_of_connectors;a+=2){
     if(ch_y<0)ch_y*=-1;
 
     size_t lines_len=ch_x>=ch_y?(ch_x+1):(ch_y+1);
-    // if(lines_len==1)continue;
+    if(lines_len==1)continue;
     Vectex* lines_arr=calloc(lines_len,sizeof(Vectex)); // an array for storing vectex pointer to be coloured to form the line
     bresenhame_line_algo(v1.px,v1.py,v2.px,v2.py,v1.z,v2.z,lines_arr);
 
