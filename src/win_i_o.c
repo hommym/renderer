@@ -86,25 +86,25 @@ if(win==NULL){
                 case SDLK_LEFT:
                     // call your camera / scene handler for LEFT here
                     printf("Left Arrow key pressed\n");
-                    move_camera(5,MOV_LEFT);
+                    move_camera(30,MOV_LEFT);
                     render(true);
                     break;
                 case SDLK_RIGHT:
                     // call your camera / scene handler for RIGHT here
                     printf("Right Arrow key pressed\n");
-                    move_camera(5,MOV_RIGHT);
+                    move_camera(30,MOV_RIGHT);
                     render(true);
                     break;
                 case SDLK_UP:
                     // call your camera / scene handler for UP here
                     printf("Up Arrow key pressed\n");
-                    move_camera(5,MOV_UP);
+                    move_camera(30,MOV_UP);
                     render(true);
                     break;
                 case SDLK_DOWN:
                     // call your camera / scene handler for DOWN here
                     printf("Down Arrow key pressed\n");
-                    move_camera(5,MOV_DOWN);
+                    move_camera(30,MOV_DOWN);
                     render(true);
                     break;
                 }
