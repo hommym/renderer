@@ -136,7 +136,7 @@ void renderer_resize(uint32_t win_w,uint32_t win_h){
     screen_hieght=win_h;
     calc_screen_end_cordinate(win_w,camera_position.x,&(camera_position.x_end));
     calc_screen_end_cordinate(win_h,camera_position.y,&(camera_position.y_end));
-    create_frame_buffer(win_w,win_h);
+    clear_frame_buffer();
 }
 
 void move_camera(double unit,Movement direction){
