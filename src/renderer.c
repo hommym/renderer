@@ -1,5 +1,5 @@
 #include "renderer.h"
-uint32_t focal_len=600;
+uint32_t focal_len=32;
 uint32_t screen_width; //max column on fram_buffer
 uint32_t screen_hieght; // max row on frame_buffer
 static CameraPos camera_position={
