@@ -93,8 +93,8 @@ Object tree_pointcloud={
     .colour=0xFF000000,
 };
 
-Object scene[4]={model,tree_pointcloud};
-render_init(scene,2,w,h,true);
+Object scene[4]={model,tree_pointcloud,cube};
+render_init(scene,3,w,h,true);
 render(true);
 
 // update_win((Vectex*)frame);
