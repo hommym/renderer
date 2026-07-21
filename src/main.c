@@ -96,9 +96,7 @@ Object tree_pointcloud={
 Object scene[4]={model,tree_pointcloud,cube};
 render_init(scene,3,w,h,true);
 render(true);
-
-// update_win((Vectex*)frame);
-
+update_win((PixelCord*)frame);
 set_up_event_handler();
 return   EXIT_SUCCESS;
 }

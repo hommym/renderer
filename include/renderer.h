@@ -8,15 +8,18 @@
 #include "projection.h"
 #include "wireframe.h"
 
-typedef struct CameraPos{
+typedef struct Camera{
 double x; // starting positions
 double y;
 double z;
 
 double x_end;
 double y_end;
-double z_end; // far plane distance
-} CameraPos;
+double z_end;  // far plane distance
+double focal_l; // focal length, derived from screen_hieght and v_fov
+const double v_fov; // vertical fov (rad), constant input
+double h_fov; // horizontal fov (rad), derived from aspect ratio
+} Camera;
 
 typedef struct Vectex
 {
@@ -29,6 +32,17 @@ uint32_t colour;
 bool in_use;
 
 } Vectex;
+
+
+typedef struct PixelCord{
+double px;  
+double py;
+double z;
+bool is_visible;
+bool in_use;
+uint32_t colour;
+} PixelCord;
+
 
 
 
@@ -54,7 +68,7 @@ typedef enum Movement{
 
 
 
-extern uint32_t focal_len;
+
 extern uint32_t screen_width;
 extern uint32_t screen_hieght;
 extern Object* objects;
@@ -69,5 +83,6 @@ bool  render(bool wirefame_mode);
 void clear_frame_buffer();
 void renderer_resize(uint32_t win_w,uint32_t win_h);
 void move_camera(double unit,Movement direction);
+Camera get_camera_pos();
 
 #endif

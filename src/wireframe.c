@@ -6,9 +6,10 @@
 
 
 
-void bresenhame_line_algo(uint64_t x1,uint64_t y1,uint64_t x2,uint64_t y2,double z1,double z2,Vectex* lines_arr){
+void bresenhame_line_algo(double x1,double y1,double x2,double y2,double z1,double z2,PixelCord* lines_arr){
 size_t lines_arr_pointer=0;
-uint64_t x,y,x0,y0;
+Camera camera=get_camera_pos();
+double x,y,x0,y0;
 int8_t step_x,step_y;
 double slope=0.0;
 double error=0.0;
@@ -46,8 +47,9 @@ z_step=(z1-z2)/(double)ch_x;
 }
 
 for(;x<=x0;x++){
-//save vectex to be coloured 
-lines_arr[lines_arr_pointer]=(Vectex){ 0.0, 0.0, z, x, y, 0,true};
+//save vectex to be coloured
+bool is_visible= (x>=0&&x<screen_width) && (y>=0&&y<screen_hieght) && z>=camera.z&&z<=camera.z_end;
+lines_arr[lines_arr_pointer]=(PixelCord){.px=x,.py=y,.z=z,.in_use=true,.is_visible=is_visible};
 lines_arr_pointer++;
 error+=slope;
 if(error>=1.0){
@@ -90,7 +92,8 @@ z_step=(z1-z2)/(double)ch_y;
 
 for(;y<=y0;y++){
 //save vectex to be coloured 
-lines_arr[lines_arr_pointer]= (Vectex){ 0.0, 0.0, z, x, y, 0,true};
+bool is_visible= (x>=0&&x<screen_width) && (y>=0&&y<screen_hieght) && z>=camera.z&&z<camera.z_end;
+lines_arr[lines_arr_pointer]= (PixelCord){.px=x,.py=y,.z=z,.in_use=true,.is_visible=is_visible};
 lines_arr_pointer++;
 error+=slope;
 if(error>=1.0){

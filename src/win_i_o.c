@@ -121,7 +121,7 @@ if(win==NULL){
 }
 
 
-void update_win(Vectex* frame_buffer){
+void update_win(PixelCord* frame_buffer){
 if(win==NULL){
     printf("No window to update\n");
     return;
@@ -160,7 +160,7 @@ if(pixel_buffer==NULL || pb_w!=w || pb_h!=h){
     pb_h=h;
 }
 
-// flatten the Vectex grid into ARGB pixels for SDL.
+// flatten the PixelCord grid into ARGB pixels for SDL.
 // empty cells (never written by render()) paint as white background;
 // occupied cells (.in_use==true) paint with their own .colour.
 size_t total=(size_t)w*(size_t)h;
