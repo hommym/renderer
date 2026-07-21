@@ -57,6 +57,7 @@ if(win==NULL){
                     renderer_resize((uint32_t)nw, (uint32_t)nh);
                     render(true);
                 }
+                update_win(frame);
                 break;
             case SDL_EVENT_MOUSE_MOTION:
                 printf("Mouse is moving\n");
@@ -77,6 +78,7 @@ if(win==NULL){
                     move_camera(10,MOV_BACKWARD);
                     render(true);
                 }
+                update_win(frame);
                 break;
             case SDL_EVENT_KEY_DOWN:
                 // for handling arrow keys press
@@ -108,12 +110,11 @@ if(win==NULL){
                     render(true);
                     break;
                 }
-             
+
                 }
+                update_win(frame);
                 break;
             }
-
-            update_win(frame);
         }
         
     }
