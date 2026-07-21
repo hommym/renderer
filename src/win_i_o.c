@@ -70,12 +70,12 @@ if(win==NULL){
                 // event.wheel.y < 0 -> scroll down / toward user   -> backward
                 if(event.wheel.y > 0){
                     printf("Scroll up (forward)\n");
-                    move_camera(10,MOV_FORWARD);
+                    move_camera(30,MOV_FORWARD);
                     render(true);
                 }
                 else if(event.wheel.y < 0){
                     printf("Scroll down (backward)\n");
-                    move_camera(10,MOV_BACKWARD);
+                    move_camera(30,MOV_BACKWARD);
                     render(true);
                 }
                 update_win(frame);
