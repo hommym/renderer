@@ -6,11 +6,12 @@ Open problems in the renderer. Each entry: what breaks, why it breaks, fix direc
 
 ## 1. Hidden-surface removal for wireframes
 
-**What breaks.** A closed mesh looks like spaghetti instead of an outline. Edges on the *back* side of the mesh draw right through the front, everywhere they don't overlap a front edge.
+**What breaks.** A closed mesh looks like spaghetti instead of an outline. Edges on the _back_ side of the mesh draw right through the front, everywhere they don't overlap a front edge.
 
 **Why.** The wireframe path rasterizes every edge in `Object.connectors_sequence` unconditionally. Where two edges overlap in screen space, the per-pixel depth compare picks the front — that's correct. Where a back edge doesn't overlap anything, it draws unopposed, because the pipeline never asks "is this edge even visible from the camera?"
 
-**Fix path.** Filter out non-visible edges *before* rasterization. Two approaches:
+**Fix path.** Filter out non-visible edges _before_ rasterization. Two approaches:
+
 - Upstream: back-face / dihedral filter at mesh load time. That's what the GLB import script (`tools/glb_to_header.py`) is doing at 80° crease — it drops edges shared by two nearly-coplanar triangles.
 - In-pipeline: per-edge occlusion test against the current depth buffer before rasterizing.
 
@@ -22,65 +23,50 @@ Open problems in the renderer. Each entry: what breaks, why it breaks, fix direc
 
 **Why.** World points are consumed by the projection directly. There is no view matrix, no per-Object model matrix, no matrix pipeline at all. Rotating an Object today means mutating its `vertices` array in place — which literally moves the model in the world, so you can't tell "Object rotated" apart from "camera rotated the other way relative to a stationary Object."
 
-**Fix path.** Add a 4×4 transform matrix to `Object` (the model matrix) and one to `CameraPos` (the view matrix). Multiply each vertex by `view * model` before projection.
+**Fix path.** Add a 4×4 transform matrix to `Object` (the model matrix) and one to `Camera` (the view matrix). Multiply each vertex by `view * model` before projection.
 
 ---
 
-## 3. Near-plane blowup on mixed-visibility edges
+## 3. Wireframe edges crossing the near plane cost unbounded time and memory
 
-**What breaks.** An edge with one endpoint in front of the camera and one endpoint behind (or at very small z) projects the bad endpoint to a wildly wrong pixel. At `focal_len=600` (current), a tiny-z endpoint can project hundreds of screens off. If z is negative, the offset sign-flips and the endpoint reflects to the wrong side of the screen entirely.
+**What breaks.** An edge with one endpoint deep in the scene and one endpoint close to the near plane (`z ≈ camera.z`) still rasterizes to the correct pixels — the per-pixel visibility gate in `bresenhame_line_algo` drops off-screen steps. But the loop bound and the `lines_arr` allocation are sized off the _true_ projected distance between the two endpoints, which explodes as `z - camera.z → 0`:
 
-**Why.**
-```c
-offset = (xy - centre) * focal / z;   // projection.c
-```
-- `z < 0` flips the sign of the offset.
-- Tiny `z > 0` amplifies the offset by `focal/z`. At `focal=600`, `z=1` amplifies 600×.
-- `perspective_projection` returns `uint64_t`, so a negative computed pixel wraps silently to ~1.8·10¹⁹, which then feeds directly into `calloc(lines_len, ...)` — see issue 4.
+- `int64_t ch_x = p1.px - p2.px` at `renderer.c:138` can be millions or billions of pixels when one endpoint's projection amplifies through `focal / (z - camera.z)`.
+- `calloc(lines_len, sizeof(PixelCord))` at `renderer.c:146` can request hundreds of MB, or fail and return `NULL` — then `bresenhame_line_algo` writes to `NULL` → segfault.
+- Bresenham steps `x` in `double`; past ~2⁵³ the `x++` stops making progress and the loop hangs.
 
-`is_vectex_visible` only catches the edge when *both* endpoints are out of the frustum. Mixed-visibility edges get through with the bad endpoint intact.
+**Why.** `is_vectex_visible` correctly culls vertices outside the screen-mapped frustum, but the wireframe path accepts an edge if _either_ endpoint is visible (`renderer.c:129`). Both endpoints then get projected and handed to Bresenham. The projection at `projection.c:15-17` guards only `(z - camera.z) == 0` exactly — for `z - camera.z = ε` the offset amplifies by `focal / ε`.
 
-**Fix path.** Clip the edge against a finite near plane *before* projecting. Where an edge crosses `z = near`, split it and use the intersection as the new endpoint. Cheaper stopgap: reject the whole edge if either endpoint has `z < near`.
+**Fix path.** Clip the edge against the near plane _before_ projecting. Where an edge crosses `z = camera.z + near_epsilon`, split it and use the intersection as the new endpoint. That keeps both projected endpoints within a bounded distance of the screen, so `lines_len` stays sensible.
 
 ---
 
-## 4. Lines aren't clipped against the screen rectangle
+## 4. Frame-buffer indexing is unguarded, safety leans on the visibility check
 
-**What breaks.** Two symptoms:
+**What breaks.** Both write sites in `render()` — the point-cloud path at `renderer.c:116` and the wireframe path at `renderer.c:158` — index into `frame_buffer[py][px]` with no bounds check. Reads at lines 113 and 153 are also unguarded.
 
-- **Wasted work.** An edge from an in-view vertex to an off-screen vertex allocates a Bresenham buffer sized for the *full* projected span, walks the whole line, and computes every OOB pixel before the write-side guard drops it. On a scene with many partially-visible edges (a large mesh at the frustum boundary), this stacks up into real time.
-- **Latent OOB heap write.** When issue 3 wraps a projection through `uint64_t`, the caller's `ch_x = v1.px - v2.px` (signed subtract + explicit sign-flip) may collapse back to a small number — so `calloc(lines_len, ...)` allocates a small buffer. But `bresenhame_line_algo` recomputes `ch_x` from the raw `px` values and iterates from `x_start+1` to `x_end-1` — potentially billions of writes, well past the calloc'd region. Unhit today because no test scene wraps the projection, but any camera move that pushes a vertex through the near plane hits it.
+**Why.** The invariant is now "pass `is_vectex_visible` with strict `<` bounds ⇒ projected pixel ∈ (0, screen_s)". That holds because `(screen/2) * (z - camera.z) / focal_l` in `is_vectex_visible` is the algebraic inverse of the projection. But:
 
-The write-side pixel guards (`renderer.c:122, 127`) protect against *writing* OOB, not against the compute or allocation leading up to it.
+- The contract is spread across two files — `renderer.c` and `projection.c` — and neither asserts it. If the projection formula changes without a matching update to `is_vectex_visible`, silent OOB heap writes come back — the same class of bug that produced the recent "double free or corruption" abort when `is_vectex_visible` used a wider frustum than the projection.
+- The wireframe path only requires _one_ endpoint visible, then projects both. The unchecked-projected other endpoint is what Bresenham walks toward. Per-pixel `is_visible` in Bresenham re-gates before writing to `frame_buffer`, so the _writes_ stay in bounds — but see issue #3 for the runaway cost.
+- A NaN sneaking in still bypasses the visibility check quietly (all comparisons against NaN are false, so the vertex is culled — currently safe by luck). The known NaN path via `focal_l == 0` on a zero-height window is closed now that `focal_l` is a compile-time constant.
 
-**Fix path.** Cohen-Sutherland or Liang-Barsky line clipping on the projected endpoints, *before* the `calloc` and Bresenham call. Same clip covers both symptoms — the caller and Bresenham then agree on the visible line length.
-
----
-
-## 5. `calc_screen_cordinate` accumulator
-
-**What breaks (potentially).** If `render_init` is ever called more than once — for a resize, a new scene, or a reset — `camera_position.x_end / .y_end` drift outward by `2 * win_size` on the second call and worse on each subsequent call. Every frustum-bounds check and every projection center that reads those values goes wrong.
-
-**Why.** `calc_screen_cordinate` (`renderer.c:28-39`) treats `.x_end` / `.y_end` as accumulators, not outputs. First call, when the value is `0.0`, gives the right answer. Second call, it sees the previous result and drifts.
-
-Not hit today because `render_init` is idempotent (`is_init_called` guard at `renderer.c:53`), so the function only fires once per program run. The guard is load-bearing: the moment it's released, the accumulator bug is live.
-
-**Fix path.** Recompute `.x_end / .y_end` from `.x + win_size` each call — no accumulator. Then the `is_init_called` guard becomes cosmetic instead of load-bearing.
+**Fix path.** Either add write-side bounds checks back (belt-and-suspenders), or make the projection function's contract explicit — e.g. `assert(pix >= 0 && pix < screen_s)` at the end of `perspective_projection` and handle NaN upstream.
 
 ---
 
-## 6. Wireframe colour is bitwise-OR, and `Object.colour` isn't a real fallback
+## 5. Wireframe colour is bitwise-OR, and `Object.colour` isn't a fallback anywhere
 
 **What breaks.** Two things:
 
 - **The blend is wrong.** Along a wireframe edge, every rasterized pixel takes `v1.colour | v2.colour`. For same-colour endpoints this looks right. For different-colour endpoints, `red | blue = magenta` is a specific bit-flip, not a lerp — the mix looks nothing like halfway between the two.
-- **The Object default is inconsistent.** The point-cloud path honours `Object.colour` as a per-object fallback (`if(pt.colour == 0) pt.colour = obj.colour`), but the wireframe path does not. A wireframe object with `.colour = 0xFFFFFFFF` set on the Object and vertices at `.colour = 0` draws as invisible black.
+- **`Object.colour` is dead.** Neither the point-cloud path (`renderer.c:106-119`) nor the wireframe path (`renderer.c:121-161`) reads `obj.colour`. A vertex with `.colour = 0` draws as transparent black regardless of what the Object sets.
 
-**Fix path.** Along each Bresenham step, use the same `t` you already interpolate `z` with, unpack ARGB channels, lerp each, repack. Fold the `obj.colour` fallback into `v1`/`v2` colour *before* the lerp, so both primitive paths behave the same way.
+**Fix path.** Along each Bresenham step, use the same `t` you already interpolate `z` with, unpack ARGB channels, lerp each, repack. Fold the `obj.colour` fallback into `v1`/`v2` colour _before_ the lerp, so both primitive paths behave the same way.
 
 ---
 
-## 7. Deferred: perspective-correct z
+## 6. Deferred: perspective-correct z
 
 **What breaks (later).** Depth arbitration uses screen-space linear interpolation of `z` between edge endpoints. Under perspective projection this is close but slightly wrong — foreshortening biases the true `z` toward the farther endpoint. Invisible at wireframe fidelity today. Matters as soon as filled/textured triangles land.
 
