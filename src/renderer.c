@@ -19,13 +19,11 @@ static Camera camera={
 0.0,           // h_fov recomputed in setup_camera
 };
 
-Camera get_camera_pos(){
-return camera;   
-}
+
 
 Object* objects;
 static size_t objects_len=0;
-void* frame;
+static void* frame=NULL;
 
 
 
@@ -87,10 +85,17 @@ return (*pxcord_p).is_visible;
 }
 
 
+Camera get_camera_pos(){
+return camera;   
+}
 
+
+void* get_frame_buffer(){
+    return frame;
+}
 
 void render_init(Object* objs,uint64_t len,uint32_t win_w,uint32_t win_h,bool wirefame_mode){
-// needs to be called once to initialise the who renderer  
+// needs to be called once to initialise the renderer  
 create_frame_buffer(win_w,win_h);    
 objects=objs;
 objects_len=len;
@@ -101,7 +106,7 @@ setup_camera();
 
 
 bool render(bool wirefame_mode){
-
+if(frame==NULL)return false;
 
 PixelCord (*frame_buffer)[screen_width]= (PixelCord (*)[screen_width])frame;   
 
@@ -180,8 +185,8 @@ else{
 return true;
 }
 
-void clear_frame_buffer(){
-    free(frame);
+void clear_frame_buffer(bool keep_frame){
+    if(!keep_frame)free(frame);
     if(screen_hieght!=0 && screen_width!=0)create_frame_buffer(screen_width,screen_hieght);
     else frame=NULL;
 }
@@ -190,7 +195,7 @@ void renderer_resize(uint32_t win_w,uint32_t win_h){
     screen_width=win_w;
     screen_hieght=win_h;
     setup_camera();
-    clear_frame_buffer();
+    clear_frame_buffer(false);
 }
 
 void move_camera(double unit,Movement direction){
@@ -221,9 +226,6 @@ void move_camera(double unit,Movement direction){
         camera.z-=unit;
         camera.z_end-=unit;
         break;
-    }
-
-    // clear frame buffer
-    clear_frame_buffer();
+    }   
 
 }

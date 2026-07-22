@@ -26,10 +26,7 @@ typedef struct Vectex
 double x;
 double y;
 double z;
-uint64_t px;
-uint64_t py;
 uint32_t colour;
-bool in_use;
 
 } Vectex;
 
@@ -72,7 +69,7 @@ typedef enum Movement{
 extern uint32_t screen_width;
 extern uint32_t screen_hieght;
 extern Object* objects;
-extern void* frame;
+
 
 
 
@@ -80,9 +77,10 @@ extern void* frame;
 
 void  render_init(Object* objs,uint64_t len,uint32_t win_w,uint32_t win_h,bool wirefame_mode);
 bool  render(bool wirefame_mode);
-void clear_frame_buffer();
+void clear_frame_buffer(bool keep_frame);
 void renderer_resize(uint32_t win_w,uint32_t win_h);
 void move_camera(double unit,Movement direction);
 Camera get_camera_pos();
+void* get_frame_buffer();
 
 #endif

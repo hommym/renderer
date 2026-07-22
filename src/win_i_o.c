@@ -57,7 +57,7 @@ if(win==NULL){
                     renderer_resize((uint32_t)nw, (uint32_t)nh);
                     render(true);
                 }
-                update_win(frame);
+                update_win(get_frame_buffer());
                 break;
             case SDL_EVENT_MOUSE_MOTION:
                 printf("Mouse is moving\n");
@@ -71,14 +71,14 @@ if(win==NULL){
                 if(event.wheel.y > 0){
                     printf("Scroll up (forward)\n");
                     move_camera(30,MOV_FORWARD);
-                    render(true);
                 }
                 else if(event.wheel.y < 0){
                     printf("Scroll down (backward)\n");
                     move_camera(30,MOV_BACKWARD);
-                    render(true);
                 }
-                update_win(frame);
+                clear_frame_buffer(false);
+                render(true);
+                update_win(get_frame_buffer());
                 break;
             case SDL_EVENT_KEY_DOWN:
                 // for handling arrow keys press
@@ -89,30 +89,29 @@ if(win==NULL){
                     // call your camera / scene handler for LEFT here
                     printf("Left Arrow key pressed\n");
                     move_camera(30,MOV_LEFT);
-                    render(true);
                     break;
                 case SDLK_RIGHT:
                     // call your camera / scene handler for RIGHT here
                     printf("Right Arrow key pressed\n");
                     move_camera(30,MOV_RIGHT);
-                    render(true);
                     break;
                 case SDLK_UP:
                     // call your camera / scene handler for UP here
                     printf("Up Arrow key pressed\n");
                     move_camera(30,MOV_UP);
-                    render(true);
                     break;
                 case SDLK_DOWN:
                     // call your camera / scene handler for DOWN here
                     printf("Down Arrow key pressed\n");
                     move_camera(30,MOV_DOWN);
-                    render(true);
                     break;
                 }
 
+                 clear_frame_buffer(false);
+                 render(true);
+                 update_win(get_frame_buffer());
                 }
-                update_win(frame);
+               
                 break;
             }
         }

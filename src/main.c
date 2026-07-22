@@ -106,7 +106,7 @@ Object tree_pointcloud={
 Object scene[5]={cube,tri_right,bar_below,tree_pointcloud,model};
 render_init(scene,5,w,h,true);
 render(true);
-update_win((PixelCord*)frame);
+update_win((PixelCord*)get_frame_buffer());
 set_up_event_handler();
 return   EXIT_SUCCESS;
 }
