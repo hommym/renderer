@@ -103,8 +103,8 @@ Object tree_pointcloud={
 // (~1050, ...) respectively, which was correct under the old screen-center
 // frustum. re-import them through tools/*.py with a translation to origin
 // before adding them back to the scene.
-Object scene[5]={cube,tri_right,bar_below,tree_pointcloud,model};
-render_init(scene,5,w,h,true);
+Object scene[1]={cube};
+render_init(scene,1,w,h,true);
 render(true);
 update_win((PixelCord*)get_frame_buffer());
 set_up_event_handler();
