@@ -12,6 +12,7 @@ add_executable(renderer
     src/renderer.c
     src/projection.c
     src/wireframe.c
+    src/interpolation.c
 )
 
 target_include_directories(renderer PRIVATE include)

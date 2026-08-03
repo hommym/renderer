@@ -165,8 +165,6 @@ for(size_t a=0;a<obj.len_of_connectors;a+=2){
         PixelCord point0=frame_buffer[(uint64_t)point.py][(uint64_t)point.px];
 
         if(point0.in_use && point0.z<point.z) continue;
-
-        point.colour=v1.colour | v2.colour;
         frame_buffer[(uint64_t)point.py][(uint64_t)point.px]=point;
     }
     free(lines_arr);

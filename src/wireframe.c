@@ -1,5 +1,6 @@
 #include "wireframe.h"
 #include "renderer.h"
+#include "interpolation.h"
 
 
 
@@ -34,31 +35,26 @@ x=x1;
 x0=x2;
 y=y1;
 step_y=y1<=y2?1:-1;
-// walk starts near v1, so z ramps v1.z -> v2.z
-z=z1;
-z_step=(z2-z1)/(double)ch_x;
 }
 else{
 x=x2;
 x0=x1;
 y=y2;
 step_y=y2<=y1?1:-1;
-// walk starts near v2, so z ramps v2.z -> v1.z
-z=z2;
-z_step=(z1-z2)/(double)ch_x;
 }
 
 for(;x<=x0;x++){
 //save vectex to be coloured
+z=interpolate(p1.z,p2.z,ch_x,lines_arr_pointer+1);
+uint32_t colour=interpolate_u(p1.colour,p2.colour,ch_x,lines_arr_pointer+1);
 bool is_visible= (x>=0&&x<screen_width) && (y>=0&&y<screen_hieght) && z>=camera.z&&z<=camera.z_end;
-lines_arr[lines_arr_pointer]=(PixelCord){.px=x,.py=y,.z=z,.in_use=true,.is_visible=is_visible};
+lines_arr[lines_arr_pointer]=(PixelCord){.px=x,.py=y,.z=z,.in_use=true,.is_visible=is_visible,.colour=colour};
 lines_arr_pointer++;
 error+=slope;
 if(error>=1.0){
     y+=step_y;
     error-=1.0;
 }
-z+=z_step;
 }
 
 
@@ -77,25 +73,21 @@ y=y1;
 y0=y2;
 x=x1;
 step_x=x1<=x2?1:-1;
-// walk starts near v1, so z ramps v1.z -> v2.z
-z=z1;
-z_step=(z2-z1)/(double)ch_y;
 }
 else{
 y=y2;
 y0=y1;
 x=x2;
 step_x=x2<=x1?1:-1;
-// walk starts near v2, so z ramps v2.z -> v1.z
-z=z2;
-z_step=(z1-z2)/(double)ch_y;
 }
 
 
 for(;y<=y0;y++){
 //save vectex to be coloured
+z=interpolate(p1.z,p2.z,ch_y,lines_arr_pointer+1);
+uint32_t colour=interpolate_u(p1.colour,p2.colour,ch_y,lines_arr_pointer+1);
 bool is_visible= (x>=0&&x<screen_width) && (y>=0&&y<screen_hieght) && z>=camera.z&&z<camera.z_end;
-lines_arr[lines_arr_pointer]= (PixelCord){.px=x,.py=y,.z=z,.in_use=true,.is_visible=is_visible};
+lines_arr[lines_arr_pointer]= (PixelCord){.px=x,.py=y,.z=z,.in_use=true,.is_visible=is_visible,.colour=colour};
 lines_arr_pointer++;
 error+=slope;
 if(error>=1.0){
@@ -103,7 +95,6 @@ if(error>=1.0){
     error-=1.0;
 
 }
-z+=z_step;
 }
 
 
