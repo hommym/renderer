@@ -6,7 +6,9 @@
 
 
 
-void bresenhame_line_algo(double x1,double y1,double x2,double y2,double z1,double z2,PixelCord* lines_arr){
+void bresenhame_line_algo(PixelCord p1,PixelCord p2,PixelCord* lines_arr){
+double x1=p1.px, y1=p1.py, z1=p1.z;
+double x2=p2.px, y2=p2.py, z2=p2.z;
 size_t lines_arr_pointer=0;
 Camera camera=get_camera_pos();
 double x,y,x0,y0;
@@ -91,7 +93,7 @@ z_step=(z1-z2)/(double)ch_y;
 
 
 for(;y<=y0;y++){
-//save vectex to be coloured 
+//save vectex to be coloured
 bool is_visible= (x>=0&&x<screen_width) && (y>=0&&y<screen_hieght) && z>=camera.z&&z<camera.z_end;
 lines_arr[lines_arr_pointer]= (PixelCord){.px=x,.py=y,.z=z,.in_use=true,.is_visible=is_visible};
 lines_arr_pointer++;

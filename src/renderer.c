@@ -156,7 +156,7 @@ for(size_t a=0;a<obj.len_of_connectors;a+=2){
     size_t lines_len=ch_x>=ch_y?(ch_x+1):(ch_y+1);
     if(lines_len==1)continue;
     PixelCord* lines_arr=calloc(lines_len,sizeof(PixelCord)); // an array for storing vectex pointer to be coloured to form the line
-    bresenhame_line_algo(p1.px,p1.py,p2.px,p2.py,p1.z,p2.z,lines_arr);
+    bresenhame_line_algo(p1,p2,lines_arr);
 
 
     for(size_t i=0;i<lines_len;i++){
