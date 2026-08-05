@@ -46,7 +46,7 @@ step_y=y2<=y1?1:-1;
 for(;x<=x0;x++){
 //save vectex to be coloured
 z=interpolate(p1.z,p2.z,ch_x,lines_arr_pointer+1);
-uint32_t colour=interpolate_u(p1.colour,p2.colour,ch_x,lines_arr_pointer+1);
+uint32_t colour=interpolate_colour(p1.colour,p2.colour,ch_x,lines_arr_pointer+1);
 bool is_visible= (x>=0&&x<screen_width) && (y>=0&&y<screen_hieght) && z>=camera.z&&z<=camera.z_end;
 lines_arr[lines_arr_pointer]=(PixelCord){.px=x,.py=y,.z=z,.in_use=true,.is_visible=is_visible,.colour=colour};
 lines_arr_pointer++;
@@ -85,7 +85,7 @@ step_x=x2<=x1?1:-1;
 for(;y<=y0;y++){
 //save vectex to be coloured
 z=interpolate(p1.z,p2.z,ch_y,lines_arr_pointer+1);
-uint32_t colour=interpolate_u(p1.colour,p2.colour,ch_y,lines_arr_pointer+1);
+uint32_t colour=interpolate_colour(p1.colour,p2.colour,ch_y,lines_arr_pointer+1);
 bool is_visible= (x>=0&&x<screen_width) && (y>=0&&y<screen_hieght) && z>=camera.z&&z<camera.z_end;
 lines_arr[lines_arr_pointer]= (PixelCord){.px=x,.py=y,.z=z,.in_use=true,.is_visible=is_visible,.colour=colour};
 lines_arr_pointer++;
