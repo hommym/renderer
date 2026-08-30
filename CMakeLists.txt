@@ -14,6 +14,7 @@ add_executable(renderer
     src/wireframe.c
     src/interpolation.c
     src/utils.c
+    src/rasterization.c
 )
 
 target_include_directories(renderer PRIVATE include)

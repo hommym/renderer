@@ -55,7 +55,7 @@ if(win==NULL){
                     get_window_size(&nw, &nh);
                     printf("Window size changed to %dx%d\n", nw, nh);
                     renderer_resize((uint32_t)nw, (uint32_t)nh);
-                    render(false);
+                    render();
                 }
                 update_win(get_frame_buffer());
                 break;
@@ -77,7 +77,7 @@ if(win==NULL){
                     move_camera(30,MOV_BACKWARD);
                 }
                 clear_frame_buffer(false);
-                render(false);
+                render();
                 update_win(get_frame_buffer());
                 break;
             case SDL_EVENT_KEY_DOWN:
@@ -108,7 +108,7 @@ if(win==NULL){
                 }
 
                  clear_frame_buffer(false);
-                 render(false);
+                 render();
                  update_win(get_frame_buffer());
                 }
                
