@@ -9,12 +9,15 @@
 // recentred here. Model files carry their own units and origin -- the tree GLB is
 // roughly 1 unit tall -- and this camera is a fixed pinhole at the world origin,
 // so without a fit pass a model is either a speck or swallows the screen.
+// note the spelling: the file is appartement.glb, not appartment.glb
+#define MODEL_PATH "/home/arthur-herberth/Documents/models/appartement/source/appartement.glb"
+
 #define MODEL_EXTENT   420.0
 #define MODEL_CENTRE_X 180.0     // right of centre; the cube sits on the left
 #define MODEL_CENTRE_Y 0.0
 #define MODEL_CENTRE_Z 550.0
 
-int main(int argc,char** argv){
+int main(void){
 create_window();
 int w,h;
 get_window_size(&w,&h);
@@ -51,21 +54,22 @@ Object cube={
     .len_of_connectors=36,
 };
 
-// optional mesh file: ./renderer <path.ply|.obj|.gltf|.glb>
 // mesh_load allocates; mesh_free at the end releases it. the renderer only reads
 // the arrays, so a loaded Object is handed over exactly like the static cube.
+// a load failure is not fatal -- the cube still renders, which makes it obvious
+// the model is the thing that went wrong rather than the renderer.
 Object model={0};
 bool have_model=false;
-if(argc>1){
-    MeshResult r=mesh_load(argv[1],&model);
-    if(r!=MESH_OK)printf("could not load %s: %s\n",argv[1],mesh_result_string(r));
+{
+    MeshResult r=mesh_load(MODEL_PATH,&model);
+    if(r!=MESH_OK)printf("could not load %s: %s\n",MODEL_PATH,mesh_result_string(r));
     else if(!mesh_fit_to_view(&model,MODEL_EXTENT,MODEL_CENTRE_X,MODEL_CENTRE_Y,MODEL_CENTRE_Z,true)){
-        printf("%s has no usable geometry to fit\n",argv[1]);
+        printf("%s has no usable geometry to fit\n",MODEL_PATH);
         mesh_free(&model);
     }
     else{
         have_model=true;
-        printf("loaded %s: %llu vertices, %llu triangles\n",argv[1],
+        printf("loaded %s: %llu vertices, %llu triangles\n",MODEL_PATH,
                (unsigned long long)model.len_of_vertices,
                (unsigned long long)(model.len_of_connectors/3));
     }
