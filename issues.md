@@ -96,22 +96,12 @@ if(screen_hieght!=0 && screen_width!=0) create_frame_buffer(screen_width,screen_
 
 ---
 
-## 8. JPEG-textured models still load flat
+## 8. Texture-coloured models load flat
 
-**What breaks.** A model whose colour lives in JPEG textures renders as one uniform grey. PNG-textured models are now handled: the loader decodes the image and samples it per vertex.
+**What breaks.** A model whose colour lives in a texture rather than in per-vertex data renders as one uniform grey (`MESH_DEFAULT_COLOUR`). The repo's tree GLB is exactly this case: its primitive carries `POSITION`, `NORMAL` and `TEXCOORD_0`, but no `COLOR_0`.
 
-Measured across the library: the tree goes from 1 colour to 54,791; `woman_seated_v12` to 35,470; `dae_-_eco_house` to 19,890; `hand_painted_forest` to 4,004. The apartment stays flat, because all five of its textures are JPEG.
+**Why.** The renderer has no texture units — it interpolates colour between vertices — so the only way to carry a texture's appearance is to sample it per vertex at load time and bake the result into `Vectex.colour`. `tools/glb_to_header.py` did that with Pillow. Doing it in C needs a PNG decoder, which needs a zlib inflate implementation; both were out of scope for the loaders.
 
-**Why.** `src/png.c` decodes PNG only. JPEG needs Huffman decoding, dequantisation, an inverse DCT, chroma upsampling and YCbCr conversion — several times the work of PNG, which is inflate plus un-filtering. 22 of the library's 138 embedded images are JPEG.
+`mesh_load_gltf` reads `COLOR_0` when present and otherwise falls back, which is correct but leaves textured models grey.
 
-**Fix path.** A baseline JPEG decoder, or accept the gap. Note also that per-vertex baking is a ceiling, not a solution: the apartment's textures carry 83.9 million texels against 145,932 vertices, so even with a decoder it would render as soft colour blocks. The real answer is UVs on `Vectex` and a sampler in the span fill.
-
----
-
-## 9. Two library models are refused by strict spec gates
-
-**What breaks.** `citlali.glb` and `a_salsa_dance.glb` return `MESH_ERR_UNSUPPORTED` and load nothing, though their geometry is perfectly readable.
-
-**Why.** `mesh_load_gltf` refuses a node carrying a `skin` (citlali has 22) and any non-empty `extensionsRequired` (a_salsa_dance declares `KHR_materials_pbrSpecularGlossiness`). Both refusals are spec-correct — the glTF spec says a skinned mesh must ignore its node transform, and that an unsupported required extension must fail the load — but both are stricter than a geometry viewer needs. A skinned mesh in bind pose is still useful to look at, and a *material* extension changes nothing this renderer reads.
-
-**Fix path.** For skins, load the bind pose with the identity transform instead of refusing. For extensions, keep a list of names known to be geometry-irrelevant (the `KHR_materials_*` family) and only refuse the rest.
+**Fix path.** Either write an inflate + PNG decoder and sample `baseColorTexture` at each vertex's `TEXCOORD_0` (matching what the Python tool did), or read `materials[].pbrMetallicRoughness.baseColorFactor` as a flat per-primitive colour, which is a few lines and gets the model's average tone rather than its detail.

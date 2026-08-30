@@ -20,8 +20,6 @@ add_executable(renderer
     src/mesh_obj.c
     src/mesh_gltf.c
     src/json.c
-    src/png.c
-    src/inflate.c
 )
 
 target_include_directories(renderer PRIVATE include)

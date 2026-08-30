@@ -13,8 +13,6 @@ Design notes for the renderer. Companion to `issues.md` — that file tracks wha
 | `src/wireframe.c` | `bresenhame_line_algo` — walks one segment, emits one `PixelCord` per step with interpolated z and colour |
 | `src/projection.c` | `perspective_projection` — one axis of the perspective divide |
 | `src/interpolation.c` | Scalar and per-channel colour lerps |
-| `src/png.c` | PNG decoder: container, CRC32, unfiltering, all colour types and bit depths to RGBA8 |
-| `src/inflate.c` | DEFLATE (RFC 1951) and its zlib wrapper (RFC 1950), for PNG's IDAT stream |
 | `src/utils.c` | `sort_pixelcords_by_px` (insertion sort), `get_number_of_cores` |
 | `src/win_i_o.c` | SDL window, event loop, frame-buffer → texture blit |
 
@@ -206,17 +204,7 @@ Ownership matches the scene-array rule in §9: the loader `malloc`s `vertices` a
 
 What the loaders deliberately refuse rather than approximate: glTF sparse accessors, morph targets, skinned meshes, any `extensionsRequired` entry, Draco and meshopt compression, and any primitive mode other than TRIANGLES. Each of those would otherwise return geometry that is silently the wrong shape.
 
-Colour is read where the format carries it — PLY `red/green/blue`, the non-standard OBJ `v x y z r g b` extension, glTF `COLOR_0`.
-
-### Texture baking
-
-glTF almost never stores colour per vertex; it stores materials pointing at texture images. The apartment model's five 4096x4096 textures hold 83.9 million texels against 145,932 vertices — the format deliberately decouples appearance resolution from mesh density, which is why per-vertex colour is rare outside scanner output.
-
-Since `Vectex` has no UV field and the rasterizer lerps a colour rather than sampling an image, the loader closes the gap at load time: it decodes `baseColorTexture` and samples it once per vertex at that vertex's `TEXCOORD_n`, baking the result into `Vectex.colour`. Per primitive the precedence is `COLOR_0`, then texture sample (multiplied by `baseColorFactor` when both exist), then `baseColorFactor` alone, then `MESH_DEFAULT_COLOUR`.
-
-`src/png.c` and `src/inflate.c` exist for this: a PNG decoder over a from-scratch DEFLATE/zlib implementation, no external dependencies. Decoded images are cached per image index and freed on every exit path — the tree's four 2048x2048 textures are 64MB of RGBA, and its 844,711 triangles share them.
-
-This is a lossy stand-in for texturing, bounded by vertex density: it turned the tree from one flat grey into 54,791 distinct colours because that mesh is dense, but a room built from large flat walls would come out as soft blocks. Real texturing needs `u,v` on `Vectex` and a sampler in the span fill. JPEG textures are not decoded at all — see `issues.md` §8.
+Colour is read where the format carries it — PLY `red/green/blue`, the non-standard OBJ `v x y z r g b` extension, glTF `COLOR_0` — and falls back to `MESH_DEFAULT_COLOUR` otherwise. Texture-based colour is not sampled; see `issues.md` §8.
 
 ---
 
