@@ -12,3 +12,17 @@ void sort_pixelcords_by_px(PixelCord** arr, size_t n){
         arr[j]=key;
     }
 }
+
+
+int get_number_of_cores(){
+    #if defined(__unix__) || defined(__APPLE__)
+        return sysconf(_SC_NPROCESSORS_ONLN);
+    #elif defined(_WIN32) || defined(_WIN64)
+        SYSTEM_INFO sysinfo;
+        GetSystemInfo(&sysinfo);
+        return sysinfo.dwNumberOfProcessors;
+    #else
+        return -1; // when the system is  not known
+    #endif
+
+}
