@@ -1,3 +1,7 @@
+#include "projection.h"
+#include "wireframe.h"
+#include "utils.h"
+#include "interpolation.h"
 #include "renderer.h"
 
 

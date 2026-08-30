@@ -5,10 +5,6 @@
 #include <SDL3/SDL.h>
 #include <stdlib.h>
 #include <math.h>
-#include "projection.h"
-#include "wireframe.h"
-#include "utils.h"
-#include "interpolation.h"
 
 typedef struct Camera{
 double x; // starting positions
