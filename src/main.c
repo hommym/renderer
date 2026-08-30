@@ -63,18 +63,17 @@ Object tree={
     .len_of_connectors=MODEL_TRI_CONNECTOR_COUNT,
 };
 
+Object scene[2]={cube,tree};
+uint64_t scene_len=2;
+#else
+Object scene[1]={cube};
+uint64_t scene_len=1;
 #endif
 
 
 size_t cores = get_number_of_cores();
 printf("This is the number of cors %li\n",cores);
-render_init(w,h);
-// cube and tree are locals of main(), which outlives every render() call --
-// add_object only links them, it never copies or takes ownership.
-add_object(&cube);
-#ifdef HAVE_TREE_MODEL
-add_object(&tree);
-#endif
+render_init(scene,scene_len,w,h);
 render();
 update_win((PixelCord*)get_frame_buffer());
 set_up_event_handler();
