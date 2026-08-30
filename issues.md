@@ -93,3 +93,15 @@ if(screen_hieght!=0 && screen_width!=0) create_frame_buffer(screen_width,screen_
 `create_frame_buffer` unconditionally overwrites `frame` with a fresh `calloc`, so skipping the `free` does not keep the old buffer reachable — it strands it. No caller passes `true` today (all three call sites pass `false`), but `ARCHITECTURE.md` documents the flag as meaning the old buffer "still exists and can be referenced".
 
 **Fix path.** Decide what the flag means. If it is "reuse the existing allocation", return early instead of reallocating. If it is "hand ownership of the old buffer to the caller", it has to return the pointer. `create_frame_buffer` also never checks its `calloc` result; `render()` guards on `frame == NULL` but `update_win()` does not.
+
+---
+
+## 8. Texture-coloured models load flat
+
+**What breaks.** A model whose colour lives in a texture rather than in per-vertex data renders as one uniform grey (`MESH_DEFAULT_COLOUR`). The repo's tree GLB is exactly this case: its primitive carries `POSITION`, `NORMAL` and `TEXCOORD_0`, but no `COLOR_0`.
+
+**Why.** The renderer has no texture units — it interpolates colour between vertices — so the only way to carry a texture's appearance is to sample it per vertex at load time and bake the result into `Vectex.colour`. `tools/glb_to_header.py` did that with Pillow. Doing it in C needs a PNG decoder, which needs a zlib inflate implementation; both were out of scope for the loaders.
+
+`mesh_load_gltf` reads `COLOR_0` when present and otherwise falls back, which is correct but leaves textured models grey.
+
+**Fix path.** Either write an inflate + PNG decoder and sample `baseColorTexture` at each vertex's `TEXCOORD_0` (matching what the Python tool did), or read `materials[].pbrMetallicRoughness.baseColorFactor` as a flat per-primitive colour, which is a few lines and gets the model's average tone rather than its detail.

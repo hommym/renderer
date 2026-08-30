@@ -184,6 +184,28 @@ Growth is amortised O(1) with doubling, and a contiguous array is what `render()
 
 `set_objects(NULL, n)` forces the length to 0 rather than trusting `n`, so a cleared scene cannot be walked through a null pointer. Not synchronised: it must be called from the same thread as `render()`.
 
+### Mesh loading
+
+`include/mesh.h` declares one entry point per format plus a detect-and-dispatch wrapper. Sources: `src/mesh.c` (dispatch, free, fit), `src/mesh_ply.c`, `src/mesh_obj.c`, `src/mesh_gltf.c`, and `src/json.c` — a minimal read-only JSON parser written for the glTF chunk.
+
+```
+mesh_load(path, out)
+  detect by magic bytes, fall back to extension
+  -> mesh_load_ply    ascii / binary_little_endian / binary_big_endian
+  -> mesh_load_obj    text
+  -> mesh_load_gltf   .glb container and .gltf (external or data: URI buffers)
+```
+
+Every loader emits a **triangle list**, because `render()` infers the primitive kind from `len_of_connectors` and reads three at a time. n-gons are fan-triangulated at load; anything that cannot be expressed as triangles is refused with `MESH_ERR_UNSUPPORTED` rather than reinterpreted.
+
+Ownership matches the scene-array rule in §9: the loader `malloc`s `vertices` and `connectors_sequence`, the caller releases them with `mesh_free`, and the renderer only reads.
+
+`mesh_fit_to_view` is separate from parsing on purpose. Loaders return the model in its own units and origin; the fit pass rescales the longest axis to a target extent, recentres, and mirrors y (glTF and OBJ are +y up, this renderer is +y down). Without it a model is either a speck or swallows the screen, since the camera is a fixed pinhole at the world origin.
+
+What the loaders deliberately refuse rather than approximate: glTF sparse accessors, morph targets, skinned meshes, any `extensionsRequired` entry, Draco and meshopt compression, and any primitive mode other than TRIANGLES. Each of those would otherwise return geometry that is silently the wrong shape.
+
+Colour is read where the format carries it — PLY `red/green/blue`, the non-standard OBJ `v x y z r g b` extension, glTF `COLOR_0` — and falls back to `MESH_DEFAULT_COLOUR` otherwise. Texture-based colour is not sampled; see `issues.md` §8.
+
 ---
 
 ## 10. Deliberate omissions (see `issues.md`)
@@ -193,6 +215,7 @@ Growth is amortised O(1) with doubling, and a contiguous array is what `render()
 - No perspective-correct interpolation.
 - No wireframe rendering. Dropped deliberately when rasterization moved to `rasterization.c`; the Bresenham walker remains as a triangle-edge utility.
 - No explicit primitive tag on `Object` — dispatch infers it from connector count, and nothing records indices-per-primitive.
+- No texture sampling in the mesh loaders — a model coloured only by a texture loads flat.
 - No per-object colour. Every vertex carries its own.
 
 ---
