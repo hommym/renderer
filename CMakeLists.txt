@@ -15,6 +15,11 @@ add_executable(renderer
     src/interpolation.c
     src/utils.c
     src/rasterization.c
+    src/mesh.c
+    src/mesh_ply.c
+    src/mesh_obj.c
+    src/mesh_gltf.c
+    src/json.c
 )
 
 target_include_directories(renderer PRIVATE include)
