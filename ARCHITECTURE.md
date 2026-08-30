@@ -47,8 +47,8 @@ for obj in objects:
 
 ## 3. API
 
-- `render_init(win_w, win_h)` — allocates the frame buffer, records the screen size, derives the camera lens, and caches the worker count. Call once. The scene starts empty.
-- `add_object(obj)` / `remove_object(obj)` — link and unlink a caller-allocated `Object` in the scene list. See §9 for the ownership rule. Neither is safe to call concurrently with `render()`.
+- `render_init(objs, len, win_w, win_h)` — allocates the frame buffer, records the object array and screen size, derives the camera lens, and caches the worker count. Call once.
+- `set_objects(objs, len)` — re-point the renderer at the caller's object array. See §9. Not safe to call concurrently with `render()`.
 - `render()` — walks every `Object` and fills the frame buffer. Returns false only if the frame buffer is NULL.
 - `clear_frame_buffer(keep_frame)` — allocates a fresh grid at the current screen size. `keep_frame == true` is currently broken (`issues.md` §7).
 - `renderer_resize(win_w, win_h)` — updates screen size, re-derives the camera, reallocates the frame buffer.
@@ -81,7 +81,7 @@ Only the triangle path is threaded. The point-cloud path runs on the calling thr
 - `.in_use` — this cell has been written by `render()`. Doubles as the z-buffer occupancy bit: an unused cell always loses the depth test.
 - `.is_visible` — passed the frustum / screen-bounds test. Cells failing it are never stored.
 
-**`Object`** — `vertices[]` plus a flat `connectors_sequence[]` of indices into it, read three at a time. Colour is carried per vertex only; there is no per-object fallback. `len_of_connectors == 0` means point cloud. `.next` is the intrusive scene-list link, owned by the renderer — never assign it directly, and never walk it on a by-value copy of an `Object`, where it is stale.
+**`Object`** — `vertices[]` plus a flat `connectors_sequence[]` of indices into it, read three at a time. Colour is carried per vertex only; there is no per-object fallback. `len_of_connectors == 0` means point cloud.
 
 **`Camera`** — axis-aligned frustum: position `(x,y,z)`, far-plane extents `(x_end,y_end,z_end)`, and lens fields `focal_l`, `v_fov`, `h_fov`. No rotation (`issues.md` §4).
 
@@ -168,16 +168,21 @@ Interpolation across the span is linear in screen space, which is not perspectiv
 
 ### Scene list
 
-Objects form a singly linked list through `Object.next`, held by `objects_head` / `objects_tail` in `renderer.c`. `render()` walks it instead of indexing an array, so objects can be added after `render_init` — which is what a runtime mesh loader needs.
+The scene is a flat `Object` array plus a length, held as `objects` / `objects_len` in `renderer.c`. `render()` indexes it directly.
 
-**The renderer links, it does not own.** `add_object` takes a caller-allocated `Object*` and only writes its `next`; `remove_object` only unlinks. Nothing is copied and nothing is freed, so static scenes (an `Object` in a caller's stack frame or in static storage) work unchanged, and a loader hands back an `Object*` the caller frees itself.
+**The renderer only reads it.** Allocating the array, growing it, reallocating it and freeing it are all the caller's job. `set_objects(objs, len)` re-points the renderer afterwards — necessary because `realloc` may move the array, which would leave the renderer's stored base pointer dangling.
 
-Two invariants the implementation maintains:
+The usual caller-side shape:
 
-- `add_object` scans for the node before linking. Re-adding a linked object — especially the current tail — would point it at itself and `render()` would never terminate.
-- `remove_object` tracks the previous node explicitly rather than walking with an `Object**`, because unlinking the tail must move `objects_tail` back. Leaving it dangling makes the *next* `add_object` write through a node that is no longer in the list, and the new object silently never renders.
+```c
+if(len == cap){ cap = cap ? cap*2 : 8; scene = realloc(scene, cap*sizeof(Object)); }
+scene[len++] = obj;
+set_objects(scene, len);        // base pointer may have moved
+```
 
-Neither function is synchronised. Both must be called from the same thread as `render()`.
+Growth is amortised O(1) with doubling, and a contiguous array is what `render()` wants anyway — it walks every object every frame, and a linked list of separately allocated nodes costs roughly 3x at a thousand objects and far more beyond that, because each hop is a dependent load the prefetcher cannot anticipate.
+
+`set_objects(NULL, n)` forces the length to 0 rather than trusting `n`, so a cleared scene cannot be walked through a null pointer. Not synchronised: it must be called from the same thread as `render()`.
 
 ---
 
