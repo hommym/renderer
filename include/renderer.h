@@ -50,7 +50,10 @@ typedef struct Object
     uint64_t* connectors_sequence;
     uint64_t  len_of_connectors;
 
-
+    // intrusive scene-list link, owned by the renderer. set only through
+    // add_object / remove_object -- never assign it yourself, and never walk it
+    // on a by-value copy of an Object, where it is a stale pointer.
+    struct Object* next;
 } Object;
 
 typedef enum Movement{
@@ -67,7 +70,6 @@ typedef enum Movement{
 
 extern uint32_t screen_width;
 extern uint32_t screen_hieght;
-extern Object* objects;
 extern _Atomic size_t triangle_tracker;
 
 
@@ -75,7 +77,13 @@ extern _Atomic size_t triangle_tracker;
 
 
 
-void render_init(Object* objs,uint64_t len,uint32_t win_w,uint32_t win_h);
+void render_init(uint32_t win_w,uint32_t win_h);
+
+// Scene list. Both take a caller-allocated Object and only link/unlink it --
+// the renderer never frees an Object or the arrays it points at. Not safe to
+// call concurrently with render().
+void add_object(Object* obj);
+void remove_object(Object* obj);
 bool render();
 void clear_frame_buffer(bool keep_frame);
 void renderer_resize(uint32_t win_w,uint32_t win_h);

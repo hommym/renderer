@@ -25,10 +25,12 @@ static Camera camera={
 
 
 
-Object* objects;
+// scene list: singly linked through Object.next. tail is tracked so appending
+// is O(1) instead of a walk.
+static Object* objects_head=NULL;
+static Object* objects_tail=NULL;
 static Object* object;
 _Atomic size_t triangle_tracker;
-static size_t objects_len=0;
 static void* frame=NULL;
 static int num_core=0; // number of cores the running system has
 
@@ -86,16 +88,46 @@ void* get_frame_buffer(){
     return frame;
 }
 
-void render_init(Object* objs,uint64_t len,uint32_t win_w,uint32_t win_h){
-// needs to be called once to initialise the renderer
+void render_init(uint32_t win_w,uint32_t win_h){
+// needs to be called once to initialise the renderer. the scene starts empty;
+// feed it with add_object().
 num_core=get_number_of_cores(); // loading the number of core on system to know number of threads to spawn
 num_core=num_core<0?1:num_core-1;
 create_frame_buffer(win_w,win_h);
-objects=objs;
-objects_len=len;
 screen_width=win_w;
 screen_hieght=win_h;
 setup_camera();
+}
+
+
+void add_object(Object* obj){
+if(obj==NULL)return;
+// re-adding a node that is already linked would point it at itself (or splice
+// the list into a cycle) and render() would never terminate.
+for(Object* o=objects_head;o!=NULL;o=o->next) if(o==obj) return;
+obj->next=NULL;
+if(objects_tail==NULL)objects_head=objects_tail=obj;
+else{
+    objects_tail->next=obj;
+    objects_tail=obj;
+}
+}
+
+
+void remove_object(Object* obj){
+if(obj==NULL)return;
+// prev is tracked explicitly rather than walking with an Object**: unlinking
+// the tail needs the node before it, or objects_tail is left dangling and the
+// next add_object() writes through a node that is no longer in the list.
+Object* prev=NULL;
+for(Object* o=objects_head;o!=NULL;prev=o,o=o->next){
+    if(o!=obj)continue;
+    if(prev!=NULL)prev->next=o->next;
+    else objects_head=o->next;
+    if(objects_tail==o)objects_tail=prev;
+    o->next=NULL;
+    return;
+}
 }
 
 
@@ -105,13 +137,12 @@ if(frame==NULL)return false;
 PixelCord (*frame_buffer)[screen_width]= (PixelCord (*)[screen_width])frame;   
 
 
-for(size_t x=0;x<objects_len;x++){
-Object obj=objects[x];
+for(Object* obj=objects_head;obj!=NULL;obj=obj->next){
 
 // no connectors -> paint each visible vertex as one pixel
-if(obj.len_of_connectors==0){
-    for(size_t v=0;v<obj.len_of_vertices;v++){
-        Vectex pt=obj.vertices[v];
+if(obj->len_of_connectors==0){
+    for(size_t v=0;v<obj->len_of_vertices;v++){
+        Vectex pt=obj->vertices[v];
         PixelCord pc={.z=pt.z,.is_visible=false,.in_use=false,.colour=pt.colour};
         if(!is_vectex_visible(pt,&pc)) continue;
         pc.px=perspective_projection(pt.x,pt.z,camera.z,camera.focal_l,camera.x,camera.x_end,screen_width);
@@ -124,7 +155,7 @@ if(obj.len_of_connectors==0){
     continue;
 }
 
-object=objects+x;    
+object=obj;
 atomic_store(&triangle_tracker,0);
     pthread_t threads[num_core==0?1:num_core]; // Array to hold thread IDs
 
