@@ -39,21 +39,7 @@ The cube hides this because 12 triangles barely contend for the same pixel; a re
 
 ---
 
-## 3. Zero-length VLA on a single-core machine
-
-**What breaks.** `renderer.c:129` declares `pthread_t threads[num_core]` where `num_core` can be 0.
-
-**Why.** `render_init` computes `num_core = num_core<0 ? 1 : num_core-1`. On a 1-core machine `get_number_of_cores()` returns 1, so `num_core` becomes 0. C requires a VLA bound to be greater than zero; 0 is a constraint violation regardless of whether the array is indexed.
-
-UBSan confirms: `runtime error: variable length array bound evaluates to non-positive value 0`.
-
-The surrounding logic is correct — both loops are guarded by `num_core > 1`, so no threads spawn and the main thread rasterizes everything. Verified: the single-threaded path produces a byte-identical frame to the 8-worker path. This is latent UB, not an active failure.
-
-**Fix path.** Clamp the declaration: `pthread_t threads[num_core > 0 ? num_core : 1];`.
-
----
-
-## 4. `Object` cannot distinguish a triangle list from an edge list
+## 3. `Object` cannot distinguish a triangle list from an edge list
 
 **What breaks.** `render()` sends any object with `len_of_connectors != 0` to the triangle rasterizer, which reads `connectors_sequence` three at a time. Nothing records how many indices per primitive the array actually holds.
 
@@ -63,7 +49,7 @@ The surrounding logic is correct — both loops are guarded by `num_core > 1`, s
 
 ---
 
-## 5. Camera rotation
+## 4. Camera rotation
 
 **What breaks.** There is no way to rotate the camera. `move_camera(unit, Movement)` handles translation only.
 
@@ -73,7 +59,7 @@ The surrounding logic is correct — both loops are guarded by `num_core > 1`, s
 
 ---
 
-## 6. No back-face culling
+## 5. No back-face culling
 
 **What breaks.** Every triangle of a closed mesh is rasterized, including the roughly half facing away from the camera. They are then discarded by the depth compare, so the output is correct but up to twice the fill work is wasted — and under issue 1, back faces are extra contention on the same pixels.
 
@@ -83,7 +69,7 @@ The surrounding logic is correct — both loops are guarded by `num_core > 1`, s
 
 ---
 
-## 7. Depth and colour interpolation is not perspective-correct
+## 6. Depth and colour interpolation is not perspective-correct
 
 **What breaks.** Depth arbitration and the per-pixel colour lerp both interpolate linearly in *screen* space. Under perspective projection that is close but wrong — foreshortening biases the true value toward the farther endpoint. Visible as a faint seam along the diagonal where the two triangles of a quad meet, on any face with a strong colour gradient.
 
@@ -93,7 +79,7 @@ Note this applies only to the raster-time lerp. `lerp_vectex` in the near clip i
 
 ---
 
-## 8. `clear_frame_buffer(true)` leaks the old buffer
+## 7. `clear_frame_buffer(true)` leaks the old buffer
 
 **What breaks.** Calling it with `keep_frame == true` leaks the previous frame buffer — one full `screen_width * screen_height * sizeof(PixelCord)` allocation per call (48 MB at 1500x1000).
 
