@@ -49,7 +49,6 @@ typedef struct Object
     uint64_t len_of_vertices;
     uint64_t* connectors_sequence;
     uint64_t  len_of_connectors;
-    uint32_t colour;   // default colour; a vertex's own .colour overrides when non-zero
 
 
 } Object;

@@ -47,7 +47,6 @@ Object cube={
     .len_of_vertices=8,
     .connectors_sequence=cube_connectors,
     .len_of_connectors=36,
-    .colour=CUBE_COLOUR,
 };
 
 #ifdef HAVE_TREE_MODEL
