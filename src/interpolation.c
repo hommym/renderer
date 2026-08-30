@@ -6,15 +6,21 @@
 
 double interpolate(double p1,double p2,size_t num_of_items,size_t item_num){
 // this method does interpolation for decimals
+if(num_of_items==0)return p1; // a zero-length span has nowhere to walk to
 double ch_v=p2-p1;
-return p1+(ch_v/num_of_items)*item_num;
+return p1+(ch_v*item_num/num_of_items);
 }
 
 
 uint64_t interpolate_u( uint64_t p1,uint64_t p2,size_t num_of_items,size_t item_num){
-// this method does interpolation for whole numbers
-int64_t ch_v=p2-p1;
-return p1+(ch_v/num_of_items)*item_num;
+// this method does interpolation for whole numbers.
+// multiply before dividing: dividing first throws the whole gradient away
+// whenever the change is smaller than the span (255/300 == 0, so every step
+// lands back on p1). keep every term signed too — item_num is a size_t, so a
+// downward step promotes the negative change to unsigned and wraps mid-ramp.
+if(num_of_items==0)return p1; // integer divide by zero would trap
+int64_t ch_v=(int64_t)p2-(int64_t)p1;
+return (uint64_t)((int64_t)p1+(ch_v*(int64_t)item_num)/(int64_t)num_of_items);
 }
 
 // per-channel interpolation for packed 0xAARRGGBB colour. treating the whole
