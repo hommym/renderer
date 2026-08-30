@@ -21,7 +21,7 @@ if(depth != 0){
 
 double pix_point=pix_centre+offset;
 
-return pix_point;  
+return floor(pix_point);  
 }
 
 
