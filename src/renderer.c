@@ -25,7 +25,7 @@ static Camera camera={
 
 
 
-Object* objects;
+static Object* objects=NULL;
 static Object* object;
 _Atomic size_t triangle_tracker;
 static size_t objects_len=0;
@@ -86,13 +86,22 @@ void* get_frame_buffer(){
     return frame;
 }
 
+// Point the renderer at the caller's object array. The renderer only reads it:
+// growing, reallocating and freeing the array stay the caller's job, so after a
+// realloc the caller calls this again with the new base pointer and length.
+// Not safe to call concurrently with render().
+void set_objects(Object* objs,uint64_t len){
+objects=objs;
+objects_len=objs==NULL?0:len;   // a NULL array has no elements, whatever len says
+}
+
+
 void render_init(Object* objs,uint64_t len,uint32_t win_w,uint32_t win_h){
 // needs to be called once to initialise the renderer
 num_core=get_number_of_cores(); // loading the number of core on system to know number of threads to spawn
 num_core=num_core<0?1:num_core-1;
 create_frame_buffer(win_w,win_h);
-objects=objs;
-objects_len=len;
+set_objects(objs,len);
 screen_width=win_w;
 screen_hieght=win_h;
 setup_camera();

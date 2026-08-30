@@ -67,7 +67,6 @@ typedef enum Movement{
 
 extern uint32_t screen_width;
 extern uint32_t screen_hieght;
-extern Object* objects;
 extern _Atomic size_t triangle_tracker;
 
 
@@ -76,6 +75,10 @@ extern _Atomic size_t triangle_tracker;
 
 
 void render_init(Object* objs,uint64_t len,uint32_t win_w,uint32_t win_h);
+
+// Re-point the renderer at the caller's object array after it has been grown,
+// reallocated or replaced. The renderer never grows, copies or frees it.
+void set_objects(Object* objs,uint64_t len);
 bool render();
 void clear_frame_buffer(bool keep_frame);
 void renderer_resize(uint32_t win_w,uint32_t win_h);
