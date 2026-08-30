@@ -1,5 +1,6 @@
 #include "mesh.h"
 #include "json.h"
+#include "png.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -54,6 +55,15 @@ typedef struct Accessor {
     bool normalized;
 } Accessor;
 
+// one slot per images[] entry. `tried` is set before the decode, not after, so a
+// file that cannot be decoded costs one attempt for the whole load rather than
+// one per primitive -- 40 materials sharing a 2048x2048 texture is the normal
+// case, and re-decoding it each time would dwarf the rest of the loader.
+typedef struct ImgCache {
+    PngImage img;
+    bool tried;
+} ImgCache;
+
 typedef struct Ctx {
     const JsonValue* root;
     const JsonValue* buffers;
@@ -61,7 +71,12 @@ typedef struct Ctx {
     const JsonValue* accessors;
     const JsonValue* meshes;
     const JsonValue* nodes;
+    const JsonValue* materials;
+    const JsonValue* textures;
+    const JsonValue* images;
+    const JsonValue* samplers;
     Buf* bufs; size_t nbufs;
+    ImgCache* imgs; size_t nimgs;         // allocated on the first texture actually sampled
     const uint8_t* bin; size_t bin_len;   // GLB BIN chunk, borrowed from the file image
     const char* dir; size_t dir_len;      // directory of the .gltf, for relative uris
     Vectex* verts; size_t nverts, cap_verts;
@@ -246,6 +261,34 @@ static bool b64_decode(const char* s,size_t n,uint8_t** out,size_t* out_len){
 
 // ---- buffers -------------------------------------------------------------
 
+// a data: payload or a path under the model's own directory, into caller-owned
+// bytes. shared by buffers and by .gltf image uris so an image cannot reach
+// anywhere a buffer could not.
+static MeshResult uri_bytes(Ctx* c,const char* uri,uint8_t** out,size_t* out_len){
+    *out=NULL;*out_len=0;
+    if(strncmp(uri,"data:",5)==0){
+        const char* comma=strchr(uri,',');
+        if(!comma)return MESH_ERR_FORMAT;
+        size_t hdr=(size_t)(comma-uri);
+        if(hdr<7||strncmp(comma-7,";base64",7)!=0)return MESH_ERR_UNSUPPORTED; // only base64 payloads
+        if(!b64_decode(comma+1,strlen(comma+1),out,out_len))return MESH_ERR_FORMAT;
+        return MESH_OK;
+    }
+    char* dec=uri_unescape(uri);
+    if(!dec)return MESH_ERR_FORMAT;
+    if(!uri_is_safe_relative(dec)){free(dec);return MESH_ERR_UNSUPPORTED;}
+    size_t nlen=strlen(dec),plen;
+    if(!sz_add(c->dir_len,nlen,&plen)||!sz_add(plen,1,&plen)){free(dec);return MESH_ERR_FORMAT;}
+    char* full=malloc(plen);
+    if(!full){free(dec);return MESH_ERR_OOM;}
+    memcpy(full,c->dir,c->dir_len);
+    memcpy(full+c->dir_len,dec,nlen+1);
+    free(dec);
+    MeshResult r=read_whole_file(full,out,out_len);
+    free(full);
+    return r;
+}
+
 static MeshResult buffer_load(Ctx* c,size_t i,Buf* b){
     const JsonValue* bv=json_at(c->buffers,i);
     if(json_type(bv)!=JSON_OBJECT)return MESH_ERR_FORMAT;
@@ -262,27 +305,8 @@ static MeshResult buffer_load(Ctx* c,size_t i,Buf* b){
 
     uint8_t* data=NULL;
     size_t len=0;
-    if(strncmp(uri,"data:",5)==0){
-        const char* comma=strchr(uri,',');
-        if(!comma)return MESH_ERR_FORMAT;
-        size_t hdr=(size_t)(comma-uri);
-        if(hdr<7||strncmp(comma-7,";base64",7)!=0)return MESH_ERR_UNSUPPORTED; // only base64 payloads
-        if(!b64_decode(comma+1,strlen(comma+1),&data,&len))return MESH_ERR_FORMAT;
-    }else{
-        char* dec=uri_unescape(uri);
-        if(!dec)return MESH_ERR_FORMAT;
-        if(!uri_is_safe_relative(dec)){free(dec);return MESH_ERR_UNSUPPORTED;}
-        size_t nlen=strlen(dec),plen;
-        if(!sz_add(c->dir_len,nlen,&plen)||!sz_add(plen,1,&plen)){free(dec);return MESH_ERR_FORMAT;}
-        char* full=malloc(plen);
-        if(!full){free(dec);return MESH_ERR_OOM;}
-        memcpy(full,c->dir,c->dir_len);
-        memcpy(full+c->dir_len,dec,nlen+1);
-        free(dec);
-        MeshResult r=read_whole_file(full,&data,&len);
-        free(full);
-        if(r!=MESH_OK)return r;
-    }
+    MeshResult r=uri_bytes(c,uri,&data,&len);
+    if(r!=MESH_OK)return r;
     if(len<declared){free(data);return MESH_ERR_FORMAT;}
     b->data=data;b->len=declared;b->owned=true;   // trailing base64/file slop is ignored
     return MESH_OK;
@@ -428,6 +452,166 @@ static uint32_t pack_colour(const Accessor* a,size_t i){
           |((uint32_t)(g*255.0+0.5)<<8)|(uint32_t)(b*255.0+0.5);
 }
 
+// ---- base colour ---------------------------------------------------------
+
+// this renderer has no texture units, so a material's baseColorTexture is baked
+// down to one sample per vertex at load time. everything below is cosmetic: a
+// missing, malformed or undecodable link degrades to the next step of the
+// precedence chain (COLOR_0, texture, factor, MESH_DEFAULT_COLOUR) instead of
+// failing a load whose geometry is perfectly good. a jpeg reaches the same path
+// as a corrupt png -- neither is an error.
+
+typedef struct BaseColour {
+    const PngImage* tex;      // NULL unless a baseColorTexture image actually decoded
+    size_t uv_set;            // names the attribute TEXCOORD_<uv_set>
+    PngWrap wrap_s,wrap_t;
+    bool opaque;              // alphaMode OPAQUE, the default: base colour alpha is ignored
+    bool has_factor;
+    double factor[4];         // rgba, clamped to [0,1]; all ones when absent
+} BaseColour;
+
+// a bufferView as raw bytes. accessor_resolve cannot be reused here: an image
+// view carries no element type, count or stride to check against.
+static bool view_bytes(Ctx* c,size_t vi,const uint8_t** p,size_t* n){
+    if(json_type(c->views)!=JSON_ARRAY||vi>=json_count(c->views))return false;
+    const JsonValue* view=json_at(c->views,vi);
+    if(json_type(view)!=JSON_OBJECT)return false;
+    size_t bi,off,len;
+    if(!json_size(json_member(view,"buffer"),&bi))return false;
+    if(!json_size_opt(json_member(view,"byteOffset"),0,&off))return false;
+    if(!json_size(json_member(view,"byteLength"),&len)||len==0)return false;
+    const uint8_t* data;
+    size_t dlen,end;
+    if(buffer_get(c,bi,&data,&dlen)!=MESH_OK)return false;
+    if(!sz_add(off,len,&end)||end>dlen)return false;
+    *p=data+off;*n=len;
+    return true;
+}
+
+static const PngImage* image_get(Ctx* c,size_t ii){
+    if(ii>=c->nimgs)return NULL;
+    if(!c->imgs&&!(c->imgs=calloc(c->nimgs,sizeof *c->imgs)))return NULL;
+    ImgCache* e=&c->imgs[ii];
+    if(e->tried)return e->img.rgba?&e->img:NULL;
+    e->tried=true;
+
+    const JsonValue* iv=json_at(c->images,ii);
+    if(json_type(iv)!=JSON_OBJECT)return NULL;
+
+    const uint8_t* bytes=NULL;
+    uint8_t* owned=NULL;
+    size_t n=0;
+    const JsonValue* bvv=json_member(iv,"bufferView");
+    if(bvv&&json_type(bvv)!=JSON_NULL){
+        size_t vi;
+        if(!json_size(bvv,&vi)||!view_bytes(c,vi,&bytes,&n))return NULL;
+    }else{
+        const char* uri=json_member_string(iv,"uri",NULL);
+        if(!uri||uri_bytes(c,uri,&owned,&n)!=MESH_OK)return NULL;
+        bytes=owned;
+    }
+    // mimeType is not consulted: what the file calls the bytes decides nothing,
+    // whether png_decode accepts them decides everything
+    if(!png_decode(bytes,n,&e->img,NULL,0))memset(&e->img,0,sizeof e->img);
+    free(owned);
+    return e->img.rgba?&e->img:NULL;
+}
+
+static PngWrap wrap_of(double mode){
+    if(mode==33071.0)return PNG_WRAP_CLAMP;
+    if(mode==33648.0)return PNG_WRAP_MIRROR;
+    return PNG_WRAP_REPEAT;                        // 10497, and anything unrecognised
+}
+
+static void base_colour_of(Ctx* c,const JsonValue* prim,BaseColour* bc){
+    memset(bc,0,sizeof *bc);
+    for(int k=0;k<4;k++)bc->factor[k]=1.0;         // identity, so a texture alone multiplies out unchanged
+
+    size_t mi;
+    const JsonValue* miv=json_member(prim,"material");
+    if(!miv||json_type(miv)==JSON_NULL||!json_size(miv,&mi))return;
+    if(json_type(c->materials)!=JSON_ARRAY||mi>=json_count(c->materials))return;
+    const JsonValue* mat=json_at(c->materials,mi);
+    // OPAQUE is the default and it discards the base colour alpha outright, so a
+    // factor of [1,1,1,0.2] on an opaque material must not come out translucent
+    const char* am=json_member_string(mat,"alphaMode","OPAQUE");
+    bc->opaque=strcmp(am,"BLEND")!=0&&strcmp(am,"MASK")!=0;
+    const JsonValue* pbr=json_member(mat,"pbrMetallicRoughness");
+    if(json_type(pbr)!=JSON_OBJECT)return;
+
+    const JsonValue* f=json_member(pbr,"baseColorFactor");
+    if(f&&json_type(f)!=JSON_NULL){
+        // json_num_array writes as it goes, so a partial array has to be undone
+        if(json_num_array(f,4,bc->factor)){
+            for(int k=0;k<4;k++)bc->factor[k]=bc->factor[k]<0.0?0.0:(bc->factor[k]>1.0?1.0:bc->factor[k]);
+            bc->has_factor=true;
+        }else for(int k=0;k<4;k++)bc->factor[k]=1.0;
+    }
+
+    const JsonValue* bct=json_member(pbr,"baseColorTexture");
+    if(json_type(bct)!=JSON_OBJECT)return;
+    size_t ti;
+    if(!json_size(json_member(bct,"index"),&ti))return;
+    if(!json_size_opt(json_member(bct,"texCoord"),0,&bc->uv_set)||bc->uv_set>99)return;
+    if(json_type(c->textures)!=JSON_ARRAY||ti>=json_count(c->textures))return;
+    const JsonValue* tex=json_at(c->textures,ti);
+    if(json_type(tex)!=JSON_OBJECT)return;
+
+    size_t si;
+    if(json_size(json_member(tex,"sampler"),&si)&&
+       json_type(c->samplers)==JSON_ARRAY&&si<json_count(c->samplers)){
+        const JsonValue* sm=json_at(c->samplers,si);
+        bc->wrap_s=wrap_of(json_member_number(sm,"wrapS",10497.0));
+        bc->wrap_t=wrap_of(json_member_number(sm,"wrapT",10497.0));
+    }
+
+    size_t src;
+    // a source-less texture is an extension's (KHR_texture_basisu and friends);
+    // there is nothing here we know how to read
+    if(json_size(json_member(tex,"source"),&src))bc->tex=image_get(c,src);
+}
+
+// png_sample applies one wrap mode to both axes, so when wrapT disagrees with
+// wrapS the v axis is folded into [0,1) here, where every mode is a no-op. clamp
+// folds to the outermost texel *centres* rather than to 0 and 1: a bilinear tap
+// at the very edge would otherwise reach past it and pick up whatever wrapS says
+// lies there, which is the edge bleeding clamp exists to prevent. `n` is the
+// image's extent on this axis.
+static double fold(double t,PngWrap w,uint32_t n){
+    double f;
+    if(w==PNG_WRAP_CLAMP){
+        double half=n?0.5/(double)n:0.0;
+        f=t<half?half:(t>1.0-half?1.0-half:t);
+    }else{
+        f=t-floor(t);
+        if(w==PNG_WRAP_MIRROR&&fmod(floor(t),2.0)!=0.0)f=1.0-f;
+    }
+    return f<1.0?f:nextafter(1.0,0.0);
+}
+
+// glTF defines baseColor as factor * texture, so the two multiply per channel.
+// either half may be absent -- the missing one is left as white.
+static uint32_t shade(const BaseColour* bc,const Accessor* uv,size_t i){
+    double ch[4]={bc->factor[0],bc->factor[1],bc->factor[2],bc->factor[3]};
+    if(bc->tex&&uv){
+        // normalized integer texcoords are already unit-range; float ones are not
+        // meant to be, and the wrap mode is what gives them meaning
+        double u=uv->comp_type==CT_FLOAT?acc_raw(uv,i,0):acc_norm(uv,i,0);
+        double v=uv->comp_type==CT_FLOAT?acc_raw(uv,i,1):acc_norm(uv,i,1);
+        if(isfinite(u)&&isfinite(v)){
+            if(bc->wrap_t!=bc->wrap_s)v=fold(v,bc->wrap_t,bc->tex->height);
+            uint32_t t=png_sample(bc->tex,u,v,bc->wrap_s,0xFFFFFFFFu);
+            ch[0]*=(double)((t>>16)&0xFFu)/255.0;
+            ch[1]*=(double)((t>>8)&0xFFu)/255.0;
+            ch[2]*=(double)(t&0xFFu)/255.0;
+            ch[3]*=(double)((t>>24)&0xFFu)/255.0;
+        }
+    }
+    if(bc->opaque)ch[3]=1.0;
+    return ((uint32_t)(ch[3]*255.0+0.5)<<24)|((uint32_t)(ch[0]*255.0+0.5)<<16)
+          |((uint32_t)(ch[1]*255.0+0.5)<<8)|(uint32_t)(ch[2]*255.0+0.5);
+}
+
 // ---- node transforms -----------------------------------------------------
 
 // column-major, out = a * b. parent on the left, so descending the tree composes
@@ -505,6 +689,27 @@ static MeshResult emit_primitive(Ctx* c,const JsonValue* prim,const double m[16]
         have_col=true;
     }
 
+    // COLOR_0 wins outright, so a primitive that has one never touches a
+    // material -- and never decodes an image it would not have used
+    BaseColour bc={0};
+    Accessor uv;
+    bool have_uv=false;
+    if(!have_col){
+        base_colour_of(c,prim,&bc);
+        if(bc.tex){
+            char attr[24];
+            snprintf(attr,sizeof attr,"TEXCOORD_%zu",bc.uv_set);
+            size_t ui;
+            // a texcoord shorter than POSITION would leave the tail unsampled, so
+            // the whole primitive falls back rather than half of it
+            if(json_size(json_member(attrs,attr),&ui)&&accessor_resolve(c,ui,&uv)==MESH_OK&&
+               uv.ncomp==2&&uv.count>=pos.count&&
+               (uv.comp_type==CT_FLOAT||((uv.comp_type==CT_UBYTE||uv.comp_type==CT_USHORT)&&uv.normalized)))
+                have_uv=true;
+            else bc.tex=NULL;
+        }
+    }
+
     Accessor ind;
     bool have_ind=false;
     const JsonValue* iv=json_member(prim,"indices");
@@ -541,7 +746,9 @@ static MeshResult emit_primitive(Ctx* c,const JsonValue* prim,const double m[16]
         v.z=m[2]*x+m[6]*y+m[10]*z+m[14];
         if(!isfinite(v.x)||!isfinite(v.y)||!isfinite(v.z))return MESH_ERR_FORMAT;
         // a short COLOR_0 is padded rather than rejected: the geometry is still good
-        v.colour=(have_col&&i<col.count)?pack_colour(&col,i):MESH_DEFAULT_COLOUR;
+        if(have_col&&i<col.count)v.colour=pack_colour(&col,i);
+        else if(bc.tex||bc.has_factor)v.colour=shade(&bc,have_uv?&uv:NULL,i);
+        else v.colour=MESH_DEFAULT_COLOUR;
         c->verts[base+i]=v;
     }
 
@@ -676,6 +883,11 @@ static void ctx_dispose(Ctx* c){
             if(c->bufs[i].owned)free((void*)c->bufs[i].data);
         free(c->bufs);
     }
+    if(c->imgs){
+        // 2048x2048 rgba is 16MB a piece; none of it outlives the load
+        for(size_t i=0;i<c->nimgs;i++)png_free(&c->imgs[i].img);
+        free(c->imgs);
+    }
     free(c->visited);
 }
 
@@ -717,8 +929,13 @@ MeshResult mesh_load_gltf(const char* path,Object* out){
     c.accessors=json_member(c.root,"accessors");
     c.meshes=json_member(c.root,"meshes");
     c.nodes=json_member(c.root,"nodes");
+    c.materials=json_member(c.root,"materials");
+    c.textures=json_member(c.root,"textures");
+    c.images=json_member(c.root,"images");
+    c.samplers=json_member(c.root,"samplers");
     c.nbufs=json_type(c.buffers)==JSON_ARRAY?json_count(c.buffers):0;
     c.nnodes=json_type(c.nodes)==JSON_ARRAY?json_count(c.nodes):0;
+    c.nimgs=json_type(c.images)==JSON_ARRAY?json_count(c.images):0;
 
     // the .gltf's own directory, kept with its trailing separator so a relative
     // uri is just a concatenation away
