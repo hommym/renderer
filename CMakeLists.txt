@@ -18,4 +18,8 @@ add_executable(renderer
 
 target_include_directories(renderer PRIVATE include)
 
+
 target_link_libraries(renderer PRIVATE SDL3::SDL3 m)
+
+# Replace 'your_binary_name' with your actual target
+target_compile_options(renderer PRIVATE -g)
