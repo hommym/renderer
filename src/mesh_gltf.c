@@ -264,13 +264,24 @@ static bool b64_decode(const char* s,size_t n,uint8_t** out,size_t* out_len){
 // a data: payload or a path under the model's own directory, into caller-owned
 // bytes. shared by buffers and by .gltf image uris so an image cannot reach
 // anywhere a buffer could not.
+// rfc 3986: uri schemes are case-insensitive, and the ";base64" marker is
+// written both ways in the wild. matching them exactly rejects valid files.
+static bool ci_prefix(const char* s,const char* pfx,size_t n){
+    for(size_t i=0;i<n;i++){
+        unsigned char a=(unsigned char)s[i],b=(unsigned char)pfx[i];
+        if(a>='A'&&a<='Z')a=(unsigned char)(a-'A'+'a');
+        if(a!=b)return false;
+    }
+    return true;
+}
+
 static MeshResult uri_bytes(Ctx* c,const char* uri,uint8_t** out,size_t* out_len){
     *out=NULL;*out_len=0;
-    if(strncmp(uri,"data:",5)==0){
+    if(ci_prefix(uri,"data:",5)){
         const char* comma=strchr(uri,',');
         if(!comma)return MESH_ERR_FORMAT;
         size_t hdr=(size_t)(comma-uri);
-        if(hdr<7||strncmp(comma-7,";base64",7)!=0)return MESH_ERR_UNSUPPORTED; // only base64 payloads
+        if(hdr<7||!ci_prefix(comma-7,";base64",7))return MESH_ERR_UNSUPPORTED; // only base64 payloads
         if(!b64_decode(comma+1,strlen(comma+1),out,out_len))return MESH_ERR_FORMAT;
         return MESH_OK;
     }
