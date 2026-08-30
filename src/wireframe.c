@@ -15,10 +15,15 @@ Camera camera=get_camera_pos();
 double x,y,x0,y0;
 int8_t step_x,step_y;
 double slope=0.0;
-// start the error half a pixel in so a crossing rounds to the nearest row
-// instead of always flooring. at 0.0 the minor axis lags, and on some slopes
-// the accumulated error lands a hair under 1.0 at the final step, so the line
-// stops a row short of its endpoint and the scanline fill loses that row.
+// how far the true line has drifted from the row being drawn. the crossing
+// below fires at half a pixel of drift, not a full one, so a step lands on
+// whichever row is nearer -- rounding instead of flooring. it still subtracts
+// a whole 1.0, which recentres the accumulator on the new row.
+//
+// firing at 1.0 instead makes the minor axis lag by up to a full pixel and
+// puts the last crossing exactly on the comparison boundary, so a drift of
+// one ulp eats a whole row: the strip stops short of its endpoint and the
+// scanline fill loses that row.
 double error=0.0;
 double z_start=0.0;
 double z_end=0.0;
