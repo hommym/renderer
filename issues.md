@@ -27,47 +27,48 @@ Open problems in the renderer. Each entry: what breaks, why it breaks, fix direc
 
 ---
 
-## 3. Wireframe edges crossing the near plane cost unbounded time and memory
+## 3. The wireframe path still has no near-plane clip
 
-**What breaks.** An edge with one endpoint deep in the scene and one endpoint close to the near plane (`z ≈ camera.z`) still rasterizes to the correct pixels — the per-pixel visibility gate in `bresenhame_line_algo` drops off-screen steps. But the loop bound and the `lines_arr` allocation are sized off the _true_ projected distance between the two endpoints, which explodes as `z - camera.z → 0`:
+**What breaks.** An edge with one endpoint deep in the scene and one endpoint close to the near plane (`z ≈ camera.z`) draws the correct pixels — the per-pixel visibility gate in `bresenhame_line_algo` drops off-screen steps — but the loop bound and the `lines_arr` allocation are sized off the _true_ projected distance, which explodes as `z - camera.z → 0`. `calloc` can request hundreds of MB, or return `NULL` and get written through.
 
-- `int64_t ch_x = p1.px - p2.px` at `renderer.c:138` can be millions or billions of pixels when one endpoint's projection amplifies through `focal / (z - camera.z)`.
-- `calloc(lines_len, sizeof(PixelCord))` at `renderer.c:146` can request hundreds of MB, or fail and return `NULL` — then `bresenhame_line_algo` writes to `NULL` → segfault.
-- Bresenham steps `x` in `double`; past ~2⁵³ the `x++` stops making progress and the loop hangs.
+**Why.** The raster path now clips against the near plane before projecting (`clip_triangle_near`), but the wireframe branch of `render()` does not. It accepts an edge when _either_ endpoint is visible, then projects both. `perspective_projection` clamps the divisor to 1.0, which bounds the divide but not the result: a vertex one unit in front of the camera at x = -100 still projects ~86,000 pixels off screen.
 
-**Why.** `is_vectex_visible` correctly culls vertices outside the screen-mapped frustum, but the wireframe path accepts an edge if _either_ endpoint is visible (`renderer.c:129`). Both endpoints then get projected and handed to Bresenham. The projection at `projection.c:15-17` guards only `(z - camera.z) == 0` exactly — for `z - camera.z = ε` the offset amplifies by `focal / ε`.
-
-**Fix path.** Clip the edge against the near plane _before_ projecting. Where an edge crosses `z = camera.z + near_epsilon`, split it and use the intersection as the new endpoint. That keeps both projected endpoints within a bounded distance of the screen, so `lines_len` stays sensible.
+**Fix path.** Clip the edge against `z = camera.z + NEAR_PLANE_MARGIN` before projecting, using the intersection as the new endpoint — the same treatment `clip_triangle_near` gives triangles. A shared `clip_segment_near` helper would serve both paths.
 
 ---
 
-## 4. Frame-buffer indexing is unguarded, safety leans on the visibility check
+## 4. Frame-buffer indexing is unguarded in the point-cloud path
 
-**What breaks.** Both write sites in `render()` — the point-cloud path at `renderer.c:116` and the wireframe path at `renderer.c:158` — index into `frame_buffer[py][px]` with no bounds check. Reads at lines 113 and 153 are also unguarded.
+**What breaks.** The point-cloud write sites in `render()` index `frame_buffer[py][px]` with no bounds check, in both the wireframe and raster branches.
 
-**Why.** The invariant is now "pass `is_vectex_visible` with strict `<` bounds ⇒ projected pixel ∈ (0, screen_s)". That holds because `(screen/2) * (z - camera.z) / focal_l` in `is_vectex_visible` is the algebraic inverse of the projection. But:
+**Why.** The invariant is "pass `is_vectex_visible` with strict `<` bounds ⇒ projected pixel ∈ [0, screen_s)". That holds because the offset computed in `is_vectex_visible` is the algebraic inverse of the projection — but the contract is spread across `renderer.c` and `projection.c` and neither asserts it. If the projection formula changes without a matching update, silent out-of-bounds heap writes come back.
 
-- The contract is spread across two files — `renderer.c` and `projection.c` — and neither asserts it. If the projection formula changes without a matching update to `is_vectex_visible`, silent OOB heap writes come back — the same class of bug that produced the recent "double free or corruption" abort when `is_vectex_visible` used a wider frustum than the projection.
-- The wireframe path only requires _one_ endpoint visible, then projects both. The unchecked-projected other endpoint is what Bresenham walks toward. Per-pixel `is_visible` in Bresenham re-gates before writing to `frame_buffer`, so the _writes_ stay in bounds — but see issue #3 for the runaway cost.
-- A NaN sneaking in still bypasses the visibility check quietly (all comparisons against NaN are false, so the vertex is culled — currently safe by luck). The known NaN path via `focal_l == 0` on a zero-height window is closed now that `focal_l` is a compile-time constant.
+The triangle and line paths are safe by construction: Bresenham re-gates every pixel, and the span fill clamps to the screen before writing.
 
-**Fix path.** Either add write-side bounds checks back (belt-and-suspenders), or make the projection function's contract explicit — e.g. `assert(pix >= 0 && pix < screen_s)` at the end of `perspective_projection` and handle NaN upstream.
+**Fix path.** Either bounds-check the point-cloud writes, or make the contract explicit — an `assert` at the end of `perspective_projection`, plus an upstream NaN guard (all comparisons against NaN are false, so a NaN vertex is culled by luck rather than by design).
 
 ---
 
-## 5. Wireframe colour is bitwise-OR, and `Object.colour` isn't a fallback anywhere
+## 5. `Object.colour` is dead
 
-**What breaks.** Two things:
+**What breaks.** Nothing reads `obj.colour`. A vertex with `.colour == 0` draws as transparent black regardless of what the Object sets, so the per-object fallback documented in `ARCHITECTURE.md` does not exist.
 
-- **The blend is wrong.** Along a wireframe edge, every rasterized pixel takes `v1.colour | v2.colour`. For same-colour endpoints this looks right. For different-colour endpoints, `red | blue = magenta` is a specific bit-flip, not a lerp — the mix looks nothing like halfway between the two.
-- **`Object.colour` is dead.** Neither the point-cloud path (`renderer.c:106-119`) nor the wireframe path (`renderer.c:121-161`) reads `obj.colour`. A vertex with `.colour = 0` draws as transparent black regardless of what the Object sets.
-
-**Fix path.** Along each Bresenham step, use the same `t` you already interpolate `z` with, unpack ARGB channels, lerp each, repack. Fold the `obj.colour` fallback into `v1`/`v2` colour _before_ the lerp, so both primitive paths behave the same way.
+**Fix path.** Fold the fallback into the vertex colour at the top of each primitive path, before any interpolation, so all three paths behave the same way.
 
 ---
 
-## 6. Deferred: perspective-correct z
+## 6. Depth and colour interpolation is not perspective-correct
 
-**What breaks (later).** Depth arbitration uses screen-space linear interpolation of `z` between edge endpoints. Under perspective projection this is close but slightly wrong — foreshortening biases the true `z` toward the farther endpoint. Invisible at wireframe fidelity today. Matters as soon as filled/textured triangles land.
+**What breaks.** Depth arbitration and the per-pixel colour lerp both interpolate linearly in _screen_ space. Under perspective projection that is close but wrong — foreshortening biases the true value toward the farther endpoint. Visible today as a faint seam along the diagonal where the two triangles of a quad meet, on any face with a strong colour gradient.
 
-**Fix path when it matters.** Interpolate `1/z` linearly in screen space, invert per pixel. Same machinery gives you perspective-correct texture coordinates.
+**Fix path.** Interpolate `1/z` linearly in screen space and invert per pixel; interpolate `colour/z` the same way. The same machinery gives perspective-correct texture coordinates later.
+
+---
+
+## 7. No back-face culling
+
+**What breaks.** Every triangle of a closed mesh is rasterized, including the roughly half that face away from the camera. They are then discarded by the depth compare, so the output is correct but up to twice the fill work is wasted.
+
+**Why.** There is no winding-order test. `clip_triangle_near` also does not preserve winding when it splits a triangle, so a culling test would need to establish orientation from the projected vertices rather than trusting index order.
+
+**Fix path.** After projecting the three vertices, take the sign of the 2D cross product of two edges and skip triangles facing away. Decide a winding convention first, and make the clip respect it.
