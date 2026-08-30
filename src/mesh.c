@@ -1,0 +1,172 @@
+#include "mesh.h"
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <ctype.h>
+#include <math.h>
+
+// Front desk for the loaders: sniff, dispatch, validate, and the two helpers
+// (free / fit) every caller needs. The per-format parsers live in their own
+// files; nothing here knows what a PLY header looks like.
+
+// enough for the longest magic we test plus a run of leading whitespace before
+// a '{'. A pretty-printed .gltf never opens with more padding than this.
+#define HEAD_SNIFF 64
+
+static bool ci_streq(const char* a,const char* b){
+// tolower() is only defined for unsigned char values, and a path byte >= 0x80
+// is negative in a signed char.
+while(*a&&*b){
+    if(tolower((unsigned char)*a)!=tolower((unsigned char)*b))return false;
+    a++;b++;
+}
+return *a==*b;
+}
+
+// Extension of the last path component only, so a dot in a directory name
+// ("v0.9/mesh") is not mistaken for one.
+static const char* path_ext(const char* path){
+const char* base=path;
+for(const char* p=path;*p;p++)if(*p=='/'||*p=='\\')base=p+1;
+const char* dot=strrchr(base,'.');
+return (dot&&dot[1])?dot+1:NULL;
+}
+
+static size_t read_head(const char* path,unsigned char* buf,size_t cap){
+FILE* f=fopen(path,"rb");
+if(!f)return 0;
+size_t n=fread(buf,1,cap,f);   // a directory or an empty file lands here as 0
+fclose(f);
+return n;
+}
+
+MeshFormat mesh_detect_format(const char* path){
+if(!path||!*path)return MESH_FORMAT_UNKNOWN;
+
+unsigned char head[HEAD_SNIFF];
+size_t n=read_head(path,head,sizeof head);
+
+// content wins over the name: a .glb magic is unambiguous, so an mp3 extension
+// on a real GLB still loads.
+if(n>=4&&memcmp(head,"glTF",4)==0)return MESH_FORMAT_GLB;
+if(n>=4&&memcmp(head,"ply",3)==0&&(head[3]=='\n'||head[3]=='\r'))return MESH_FORMAT_PLY;
+for(size_t i=0;i<n;i++){
+    if(isspace(head[i]))continue;
+    if(head[i]=='{')return MESH_FORMAT_GLTF;
+    break;   // the first real byte settles it; anything else falls through
+}
+
+const char* ext=path_ext(path);
+if(!ext)return MESH_FORMAT_UNKNOWN;
+if(ci_streq(ext,"ply"))return MESH_FORMAT_PLY;
+if(ci_streq(ext,"obj"))return MESH_FORMAT_OBJ;
+if(ci_streq(ext,"gltf"))return MESH_FORMAT_GLTF;
+if(ci_streq(ext,"glb"))return MESH_FORMAT_GLB;
+return MESH_FORMAT_UNKNOWN;
+}
+
+// Last gate before untrusted indices reach render(), which walks
+// connectors_sequence three at a time and dereferences each entry into
+// vertices[] without checking. A loader bug or a hostile file must not become
+// an out-of-bounds read there, so re-check the whole index list here even
+// though each loader is expected to have checked it already.
+static MeshResult validate(const Object* o){
+if(!o->vertices||o->len_of_vertices==0)return MESH_ERR_EMPTY;
+if(!o->connectors_sequence||o->len_of_connectors<3)return MESH_ERR_EMPTY;
+if(o->len_of_connectors%3u)return MESH_ERR_FORMAT;   // a trailing partial triangle would be read anyway
+for(uint64_t i=0;i<o->len_of_connectors;i++)
+    if(o->connectors_sequence[i]>=o->len_of_vertices)return MESH_ERR_FORMAT;
+return MESH_OK;
+}
+
+MeshResult mesh_load(const char* path,Object* out){
+// no MESH_ERR_ARGS in the enum, and a call with nothing to open is closest to
+// "could not open the file".
+if(!out)return MESH_ERR_OPEN;
+*out=(Object){0};
+if(!path)return MESH_ERR_OPEN;
+
+MeshResult r;
+switch(mesh_detect_format(path)){
+    case MESH_FORMAT_PLY:  r=mesh_load_ply(path,out);  break;
+    case MESH_FORMAT_OBJ:  r=mesh_load_obj(path,out);  break;
+    case MESH_FORMAT_GLTF:
+    case MESH_FORMAT_GLB:  r=mesh_load_gltf(path,out); break;
+    default:               r=MESH_ERR_UNSUPPORTED;     break;
+}
+
+if(r==MESH_OK)r=validate(out);
+// covers both the loader that failed after allocating and the one that
+// succeeded into a structure validate() rejected: either way the caller is
+// promised a zeroed Object with nothing left to free.
+if(r!=MESH_OK)mesh_free(out);
+return r;
+}
+
+void mesh_free(Object* obj){
+if(!obj)return;
+free(obj->vertices);
+free(obj->connectors_sequence);
+*obj=(Object){0};   // zeroing is what makes a second call a no-op
+}
+
+const char* mesh_result_string(MeshResult r){
+switch(r){
+    case MESH_OK:              return "ok";
+    case MESH_ERR_OPEN:        return "could not open file";
+    case MESH_ERR_READ:        return "truncated or unreadable file";
+    case MESH_ERR_FORMAT:      return "malformed file";
+    case MESH_ERR_UNSUPPORTED: return "unsupported format or feature";
+    case MESH_ERR_OOM:         return "out of memory";
+    case MESH_ERR_EMPTY:       return "no triangles in file";
+}
+return "unknown mesh error";   // a value outside the enum still gets a string
+}
+
+bool mesh_fit_to_view(Object* obj,double target_extent,
+                      double cx,double cy,double cz,bool flip_y){
+if(!obj||!obj->vertices||obj->len_of_vertices==0)return false;
+// a non-finite target or centre would turn every vertex into NaN, which the
+// projection then silently drops. Refuse instead of quietly emptying the mesh.
+if(!isfinite(target_extent)||!isfinite(cx)||!isfinite(cy)||!isfinite(cz))return false;
+
+double min_x=0,min_y=0,min_z=0,max_x=0,max_y=0,max_z=0;
+uint64_t seen=0;
+for(uint64_t i=0;i<obj->len_of_vertices;i++){
+    Vectex v=obj->vertices[i];
+    // one NaN vertex poisons every later comparison (NaN compares false both
+    // ways, so the box stops growing), so skip it rather than fold it in.
+    if(!isfinite(v.x)||!isfinite(v.y)||!isfinite(v.z))continue;
+    if(seen==0){
+        min_x=max_x=v.x; min_y=max_y=v.y; min_z=max_z=v.z;
+    }else{
+        if(v.x<min_x)min_x=v.x; else if(v.x>max_x)max_x=v.x;
+        if(v.y<min_y)min_y=v.y; else if(v.y>max_y)max_y=v.y;
+        if(v.z<min_z)min_z=v.z; else if(v.z>max_z)max_z=v.z;
+    }
+    seen++;
+}
+if(seen==0)return false;   // every vertex was garbage
+
+double sx=max_x-min_x,sy=max_y-min_y,sz=max_z-min_z;
+double extent=sx;
+if(sy>extent)extent=sy;
+if(sz>extent)extent=sz;
+// spans of finite values can still overflow to inf (DBL_MAX to -DBL_MAX), and a
+// single-point mesh has extent 0: both make the scale meaningless.
+if(!isfinite(extent)||extent<=0.0)return false;
+
+double scale=target_extent/extent;
+if(!isfinite(scale))return false;
+
+double mx=(min_x+max_x)*0.5,my=(min_y+max_y)*0.5,mz=(min_z+max_z)*0.5;
+for(uint64_t i=0;i<obj->len_of_vertices;i++){
+    Vectex* v=&obj->vertices[i];
+    v->x=(v->x-mx)*scale+cx;
+    // model formats are +y up, this renderer is +y down; mirroring about the
+    // box centre is the same as negating after the recentre.
+    v->y=(flip_y?(my-v->y):(v->y-my))*scale+cy;
+    v->z=(v->z-mz)*scale+cz;
+}
+return true;
+}
