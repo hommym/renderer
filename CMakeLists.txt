@@ -21,6 +21,7 @@ add_executable(renderer
     src/mesh_gltf.c
     src/json.c
     src/png.c
+    src/jpeg.c
     src/inflate.c
 )
 
