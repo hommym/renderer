@@ -21,14 +21,36 @@ const double v_fov; // vertical fov (rad), constant input
 double h_fov; // horizontal fov (rad), derived from aspect ratio
 } Camera;
 
+
+
 typedef struct Vectex
 {
 double x;
 double y;
 double z;
+float  u;
+float  v;
 uint32_t colour;
 
 } Vectex;
+
+
+
+typedef struct Object
+{
+    Vectex*   vertices;
+    uint64_t  len_of_vertices;
+    uint64_t* connectors_sequence;
+    uint64_t  len_of_connectors;
+    uint32_t* texture;
+    size_t    texture_width;
+    size_t    texture_height;
+
+} Object;
+
+
+
+
 
 
 typedef struct PixelCord{
@@ -37,21 +59,16 @@ double py;
 double z;
 bool is_visible;
 bool in_use;
+float  u;
+float  v;
 uint32_t colour;
 } PixelCord;
 
 
 
 
-typedef struct Object
-{
-    Vectex* vertices;
-    uint64_t len_of_vertices;
-    uint64_t* connectors_sequence;
-    uint64_t  len_of_connectors;
 
 
-} Object;
 
 typedef enum Movement{
     MOV_RIGHT,

@@ -27,8 +27,11 @@ double slope=0.0;
 double error=0.0;
 double z_start=0.0;
 double z_end=0.0;
-uint32_t colour_start=0;
-uint32_t colour_end=0;
+float u_start=0.0;
+float u_end=0.0;
+
+float v_start=0.0;
+float v_end=0.0;
 //calculating change in x and y
 int64_t ch_x=x2-x1;
 int64_t ch_y=y2-y1;
@@ -48,8 +51,11 @@ y=y1;
 step_y=y1<=y2?1:-1;
 z_start=p1.z;
 z_end=p2.z;
-colour_start=p1.colour;
-colour_end=p2.colour;
+u_start=p1.u;
+v_start=p1.v;
+
+u_end=p2.u;
+v_end=p2.v;
 }
 else{
 x=x2;
@@ -58,9 +64,11 @@ y=y2;
 step_y=y2<=y1?1:-1;
 z_start=p2.z;
 z_end=p1.z;
-colour_start=p2.colour;
-colour_end=p1.colour;
+u_start=p2.u;
+v_start=p2.v;
 
+u_end=p1.u;
+v_end=p1.v;
 }
 
 for(;x<=x0;x++){
@@ -69,9 +77,11 @@ for(;x<=x0;x++){
 // lines_arr_pointer. adding 1 pushed pixel 0 off the start point and ran the
 // last pixel past p2 entirely.
 double z=interpolate(z_start,z_end,ch_x,lines_arr_pointer);
-uint32_t colour=interpolate_colour(colour_start,colour_end,ch_x,lines_arr_pointer);
+float u=interpolate(u_start,u_end,ch_x,lines_arr_pointer);
+float v=interpolate(v_start,v_end,ch_x,lines_arr_pointer);
+
 bool is_visible= (x>=0&&x<screen_width) && (y>=0&&y<screen_hieght) && z>=camera.z&&z<=camera.z_end;
-lines_arr[lines_arr_pointer]=(PixelCord){.px=x,.py=y,.z=z,.in_use=true,.is_visible=is_visible,.colour=colour};
+lines_arr[lines_arr_pointer]=(PixelCord){.px=x,.py=y,.z=z,.in_use=true,.is_visible=is_visible,.u=u,.v=v};
 lines_arr_pointer++;
 error+=slope;
 if(error>=0.5){
@@ -98,8 +108,12 @@ x=x1;
 step_x=x1<=x2?1:-1;
 z_start=p1.z;
 z_end=p2.z;
-colour_start=p1.colour;
-colour_end=p2.colour;
+
+u_start=p1.u;
+v_start=p1.v;
+
+u_end=p2.u;
+v_end=p2.v;
 }
 else{
 y=y2;
@@ -108,17 +122,22 @@ x=x2;
 step_x=x2<=x1?1:-1;
 z_start=p2.z;
 z_end=p1.z;
-colour_start=p2.colour;
-colour_end=p1.colour;
+
+u_start=p2.u;
+v_start=p2.v;
+
+u_end=p1.u;
+v_end=p1.v;
 }
 
 
 for(;y<=y0;y++){
 //save vectex to be coloured
 double z=interpolate(z_start,z_end,ch_y,lines_arr_pointer);
-uint32_t colour=interpolate_colour(colour_start,colour_end,ch_y,lines_arr_pointer);
+float u=interpolate(u_start,u_end,ch_y,lines_arr_pointer);
+float v=interpolate(v_start,v_end,ch_y,lines_arr_pointer);
 bool is_visible= (x>=0&&x<screen_width) && (y>=0&&y<screen_hieght) && z>=camera.z&&z<=camera.z_end;
-lines_arr[lines_arr_pointer]= (PixelCord){.px=x,.py=y,.z=z,.in_use=true,.is_visible=is_visible,.colour=colour};
+lines_arr[lines_arr_pointer]= (PixelCord){.px=x,.py=y,.z=z,.in_use=true,.is_visible=is_visible,.u=u,.v=v};
 lines_arr_pointer++;
 error+=slope;
 if(error>=0.5){

@@ -20,6 +20,9 @@ Vectex out;
 out.x=a.x+(b.x-a.x)*t;
 out.y=a.y+(b.y-a.y)*t;
 out.z=a.z+(b.z-a.z)*t;
+out.u=a.u+(b.u-a.u)*t;
+out.v=a.v+(b.v-a.v)*t;
+
 // reuse the per-channel lerp rather than blending the packed word, which
 // would carry bits between channels. 1000 steps is far finer than 8 bits.
 out.colour=interpolate_colour(a.colour,b.colour,1000,(size_t)(t*1000.0+0.5));
@@ -106,9 +109,12 @@ return (*pxcord_p).is_visible;
 
 
 
-static void rasterizer(Vectex source_triangle[3]){
-PixelCord (*frame_buffer)[screen_width]= (PixelCord (*)[screen_width])get_frame_buffer();   
- 
+static void rasterizer(Vectex source_triangle[3],Object* obj){
+PixelCord (*frame_buffer)[screen_width]= (PixelCord (*)[screen_width])get_frame_buffer(); 
+size_t w=(*obj).texture_width;
+
+uint32_t (*texture)[w]=(uint32_t (*)[w]) (*obj).texture;
+
 // clip against the near plane before projecting. a vertex at or behind the
 // get_camera_pos() has no meaningful projection, so it has to be replaced by the point
 // where its edges cross the plane — one triangle can come back as two.
@@ -151,7 +157,7 @@ bool outer_projected=false;
         if(edge_a!=1){
 
          if(!outer_projected){
-            triangle_proj[edge_a]=(PixelCord){.z=v1.z,.colour=v1.colour,.is_visible=triangle_proj[edge_a].is_visible,.in_use=true};
+            triangle_proj[edge_a]=(PixelCord){.z=v1.z,.u=v1.u,.v=v1.v,.is_visible=triangle_proj[edge_a].is_visible,.in_use=true};
             triangle_proj[edge_a].px=perspective_projection(v1.x,v1.z,get_camera_pos().z,get_camera_pos().focal_l,get_camera_pos().x,get_camera_pos().x_end,screen_width);
             triangle_proj[edge_a].py=perspective_projection(v1.y,v1.z,get_camera_pos().z,get_camera_pos().focal_l,get_camera_pos().y,get_camera_pos().y_end,screen_hieght);
 
@@ -159,7 +165,7 @@ bool outer_projected=false;
             min_y=triangle_proj[edge_a].py;
             max_y=triangle_proj[edge_a].py;
          }
-         triangle_proj[edge_b]=(PixelCord){.z=v2.z,.colour=v2.colour,.is_visible=triangle_proj[edge_b].is_visible,.in_use=true};
+         triangle_proj[edge_b]=(PixelCord){.z=v2.z,.u=v2.u,.v=v2.v,.is_visible=triangle_proj[edge_b].is_visible,.in_use=true};
          triangle_proj[edge_b].px=perspective_projection(v2.x,v2.z,get_camera_pos().z,get_camera_pos().focal_l,get_camera_pos().x,get_camera_pos().x_end,screen_width);
          triangle_proj[edge_b].py=perspective_projection(v2.y,v2.z,get_camera_pos().z,get_camera_pos().focal_l,get_camera_pos().y,get_camera_pos().y_end,screen_hieght);
 
@@ -274,13 +280,17 @@ if((next.px-current.px)!=1){
         size_t fill_i=(size_t)(fill_x-current.px);
         PixelCord fill_pixel={.py=current.py,.px=fill_x,
         .z=interpolate(current.z,next.z,span,fill_i),
-        .colour=interpolate_colour(current.colour,next.colour,span,fill_i),
+        .u=interpolate(current.u,next.u,span,fill_i),
+        .v=interpolate(current.v,next.v,span,fill_i),
         .in_use=true
         };
         fill_pixel.is_visible=(current.py>=0&&current.py<screen_hieght) && fill_pixel.z>=get_camera_pos().z&&fill_pixel.z<=get_camera_pos().z_end;
         if(!fill_pixel.is_visible)continue;
         PixelCord existing=frame_buffer[(uint64_t)fill_pixel.py][(uint64_t)fill_pixel.px];
+        size_t f_row=(size_t)((*obj).texture_height*fill_pixel.v);
+        size_t f_col=(size_t)((*obj).texture_width*fill_pixel.u);
 
+        fill_pixel.colour=texture[f_row][f_col];
         // z-buffer test: only overwrite if this pixel is closer to the get_camera_pos().
         if(!(existing.in_use && existing.z<fill_pixel.z))frame_buffer[(uint64_t)fill_pixel.py][(uint64_t)fill_pixel.px]=fill_pixel;
     }
@@ -292,7 +302,9 @@ if((next.px-current.px)!=1){
 
 if(!current.is_visible)continue;
 PixelCord existing=frame_buffer[(uint64_t)current.py][(uint64_t)current.px];
-
+size_t c_row=(size_t)((*obj).texture_height*current.v);
+size_t c_col=(size_t)((*obj).texture_width*current.u);
+current.colour=texture[c_row][c_col];
 // z-buffer test again for the edge pixel itself.
 if(!(existing.in_use && existing.z<current.z))frame_buffer[(uint64_t)current.py][(uint64_t)current.px]=current;
 }
@@ -316,7 +328,7 @@ Vectex triangle[3]={obj.vertices[obj.connectors_sequence[current_triangle_pointe
 obj.vertices[obj.connectors_sequence[current_triangle_pointer++]],
 obj.vertices[obj.connectors_sequence[current_triangle_pointer]]
 };
-rasterizer(triangle);   
+rasterizer(triangle,get_current_object());   
 current_triangle_pointer=atomic_fetch_add(&triangle_tracker,3); 
 }
 

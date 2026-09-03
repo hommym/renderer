@@ -119,15 +119,20 @@ Object obj=objects[x];
 
 // no connectors -> paint each visible vertex as one pixel
 if(obj.len_of_connectors==0){
+    size_t w=obj.texture_width;
+    uint32_t (*texture)[w]=(uint32_t (*)[w]) (obj).texture;
     for(size_t v=0;v<obj.len_of_vertices;v++){
         Vectex pt=obj.vertices[v];
-        PixelCord pc={.z=pt.z,.is_visible=false,.in_use=false,.colour=pt.colour};
+        PixelCord pc={.z=pt.z,.is_visible=false,.in_use=false,.u=pt.u,.v=pt.v};
         if(!is_vectex_visible(pt,&pc)) continue;
         pc.px=perspective_projection(pt.x,pt.z,camera.z,camera.focal_l,camera.x,camera.x_end,screen_width);
         pc.py=perspective_projection(pt.y,pt.z,camera.z,camera.focal_l,camera.y,camera.y_end,screen_hieght);
         PixelCord point0=frame_buffer[(uint64_t)pc.py][(uint64_t)pc.px];
         if(point0.in_use && point0.z<pt.z) continue;
         pc.in_use=true;
+        size_t pc_row=(size_t)(obj.texture_height*pc.v);
+        size_t pc_col=(size_t)(obj.texture_width*pc.u);
+        pc.colour=texture[pc_row][pc_col];
         frame_buffer[(uint64_t)pc.py][(uint64_t)pc.px]=pc;
     }
     continue;
