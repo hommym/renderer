@@ -28,6 +28,7 @@ add_executable(renderer
     src/utils.c
     src/transform.c
     src/rasterization.c
+    src/ui.c
     src/mesh.c
     src/mesh_ply.c
     src/mesh_obj.c
