@@ -14,6 +14,7 @@ add_executable(renderer
     src/wireframe.c
     src/interpolation.c
     src/utils.c
+    src/transform.c
     src/rasterization.c
     src/mesh.c
     src/mesh_ply.c

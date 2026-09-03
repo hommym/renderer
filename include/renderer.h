@@ -19,6 +19,13 @@ double z_end;  // far plane distance
 double focal_l; // focal length, derived from screen_hieght and v_fov
 const double v_fov; // vertical fov (rad), constant input
 double h_fov; // horizontal fov (rad), derived from aspect ratio
+
+// Where the camera is looking. The box above stays axis-aligned; these two
+// rotate the WORLD into the camera's frame instead (see transform.h), which is
+// what lets the projection, the near clip and the frustum cull stay exactly as
+// they were. Both zero is the original camera: straight down +z.
+double yaw;     // radians, about the vertical axis, positive turns right
+double pitch;   // radians, about the horizontal axis, positive looks up
 } Camera;
 
 
@@ -99,7 +106,16 @@ void set_objects(Object* objs,uint64_t len);
 bool render();
 void clear_frame_buffer(bool keep_frame);
 void renderer_resize(uint32_t win_w,uint32_t win_h);
+// Movement is relative to where the camera is looking: MOV_FORWARD follows the
+// gaze including pitch, MOV_LEFT/RIGHT strafe along the horizontal right axis,
+// and MOV_UP/DOWN stay on the world vertical so they cannot be tilted into a
+// dive.
 void move_camera(double unit,Movement direction);
+
+// Turn the camera in place. Deltas in radians, added to the current angles.
+// Pitch is clamped just short of straight up and straight down: at exactly
+// vertical the horizontal heading is undefined and the view rolls.
+void rotate_camera(double d_yaw,double d_pitch);
 Camera get_camera_pos();
 void* get_frame_buffer();
 Object* get_current_object();

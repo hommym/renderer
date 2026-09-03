@@ -4,6 +4,7 @@
 #include "wireframe.h"
 #include "utils.h"
 #include "interpolation.h"
+#include "transform.h"
 
 
 // How far in front of the camera the near plane sits, in world units. The
@@ -115,11 +116,20 @@ size_t w=(*obj).texture_width;
 
 uint32_t (*texture)[w]=(uint32_t (*)[w]) (*obj).texture;
 
+// rotate into the camera's frame before anything else looks at these
+// coordinates. after this the camera's forward direction IS +z, which is the
+// situation the clip, the projection and the frustum cull were all written
+// against — none of them need to know the camera can turn. a copy, because
+// source_triangle points into the object's own vertex array.
+Vectex view_triangle[3]={view_apply(source_triangle[0]),
+                         view_apply(source_triangle[1]),
+                         view_apply(source_triangle[2])};
+
 // clip against the near plane before projecting. a vertex at or behind the
 // get_camera_pos() has no meaningful projection, so it has to be replaced by the point
 // where its edges cross the plane — one triangle can come back as two.
 Vectex clipped[2][3];
-uint8_t clipped_count=clip_triangle_near(source_triangle,clipped);
+uint8_t clipped_count=clip_triangle_near(view_triangle,clipped);
 for(uint8_t clip_i=0;clip_i<clipped_count;clip_i++){
 Vectex triangle[3]={clipped[clip_i][0],clipped[clip_i][1],clipped[clip_i][2]};
 double min_y=0,max_y=0;

@@ -4,6 +4,7 @@
 #include "utils.h"
 #include "interpolation.h"
 #include "rasterization.h"
+#include "transform.h"
 
 
 
@@ -21,6 +22,8 @@ static Camera camera={
 0.0,           // focal_l recomputed in setup_camera
 1.047197551,   // v_fov (const): 60 deg in rad
 0.0,           // h_fov recomputed in setup_camera
+0.0,           // yaw:   looking straight down +z
+0.0,           // pitch: level
 };
 
 
@@ -111,6 +114,10 @@ setup_camera();
 bool render(){
 if(frame==NULL)return false;
 
+// rebuild the camera basis once for the whole frame. every vertex is rotated
+// into view space with it, and the rasterization threads only read it.
+view_refresh();
+
 PixelCord (*frame_buffer)[screen_width]= (PixelCord (*)[screen_width])frame;   
 
 
@@ -122,7 +129,9 @@ if(obj.len_of_connectors==0){
     size_t w=obj.texture_width;
     uint32_t (*texture)[w]=(uint32_t (*)[w]) (obj).texture;
     for(size_t v=0;v<obj.len_of_vertices;v++){
-        Vectex pt=obj.vertices[v];
+        // into the camera's frame first, exactly like the triangle path. a copy,
+        // never in place: obj.vertices is the caller's and is walked every frame.
+        Vectex pt=view_apply(obj.vertices[v]);
         PixelCord pc={.z=pt.z,.is_visible=false,.in_use=false,.u=pt.u,.v=pt.v};
         if(!is_vectex_visible(pt,&pc)) continue;
         pc.px=perspective_projection(pt.x,pt.z,camera.z,camera.focal_l,camera.x,camera.x_end,screen_width);
@@ -182,34 +191,66 @@ void renderer_resize(uint32_t win_w,uint32_t win_h){
     clear_frame_buffer(false);
 }
 
+// Slide the whole camera box by (dx,dy,dz). Both ends of every axis move
+// together, so the box keeps its shape and only the eye at its centre travels.
+static void translate_camera(double dx,double dy,double dz){
+    camera.x+=dx;      camera.x_end+=dx;
+    camera.y+=dy;      camera.y_end+=dy;
+    camera.z+=dz;      camera.z_end+=dz;
+}
+
 void move_camera(double unit,Movement direction){
+    // the camera's own axes, so "forward" means where it is pointing rather
+    // than +z. at zero rotation these are the world axes and this behaves
+    // exactly as the old switch did.
+    double fwd[3],right[3];
+    camera_axes(fwd,right,NULL);
+
     switch (direction)
     {
     case MOV_LEFT:
-        camera.x-=unit;
-        camera.x_end-=unit;
+        translate_camera(-right[0]*unit,-right[1]*unit,-right[2]*unit);
         break;
     case MOV_RIGHT:
-        camera.x+=unit;
-        camera.x_end+=unit;
+        translate_camera(right[0]*unit,right[1]*unit,right[2]*unit);
         break;
+    // up and down deliberately ignore the camera's own vertical and use the
+    // world's. tying them to pitch means looking down and pressing up flies
+    // you into the floor, which is disorienting rather than useful.
     case MOV_UP:
-        camera.y+=unit;
-        camera.y_end+=unit;
+        translate_camera(0.0,-unit,0.0);     // +y is down
         break;
     case MOV_DOWN:
-        camera.y-=unit;
-        camera.y_end-=unit;
+        translate_camera(0.0,unit,0.0);
         break;
     case MOV_FORWARD:
-        camera.z+=unit;
-        camera.z_end+=unit;
+        translate_camera(fwd[0]*unit,fwd[1]*unit,fwd[2]*unit);
         break;
     default:
         //backewards
-        camera.z-=unit;
-        camera.z_end-=unit;
+        translate_camera(-fwd[0]*unit,-fwd[1]*unit,-fwd[2]*unit);
         break;
     }   
 
+}
+
+void rotate_camera(double d_yaw,double d_pitch){
+    if(!isfinite(d_yaw)||!isfinite(d_pitch))return;
+    camera.yaw+=d_yaw;
+    camera.pitch+=d_pitch;
+
+    // keep yaw in [-pi,pi) so it cannot drift into the range where a double
+    // stops resolving small mouse deltas. spelled out rather than M_PI, which
+    // is not defined under -std=c23.
+    const double PI=3.14159265358979323846;
+    const double TWO_PI=2.0*PI;
+    camera.yaw=fmod(camera.yaw+PI,TWO_PI);
+    if(camera.yaw<0.0)camera.yaw+=TWO_PI;
+    camera.yaw-=PI;
+
+    // stop just short of vertical. exactly straight up leaves the horizontal
+    // heading undefined, and the view rolls as it passes through.
+    const double LIMIT=1.55334303;   // 89 degrees
+    if(camera.pitch>LIMIT)camera.pitch=LIMIT;
+    if(camera.pitch<-LIMIT)camera.pitch=-LIMIT;
 }
