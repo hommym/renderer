@@ -215,8 +215,22 @@ static void frame_work(uint32_t tid){
     }
 }
 
+// Workers park here until the main thread knows how many of them actually
+// started. Everything downstream -- the barrier's participant count and the
+// rasterizer's triangle split -- is sized from that number, and a worker that
+// began before it was known would be splitting the work N ways while only M
+// threads ever arrive at the barrier.
+static pthread_mutex_t gate_m=PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t  gate_c=PTHREAD_COND_INITIALIZER;
+static bool gate_open=false;
+static bool gate_run=false;      // false means "stand down, the frame is off"
+
 static void* frame_worker(void* a){
-    frame_work((uint32_t)(uintptr_t)a);
+    pthread_mutex_lock(&gate_m);
+    while(!gate_open)pthread_cond_wait(&gate_c,&gate_m);
+    bool run=gate_run;
+    pthread_mutex_unlock(&gate_m);
+    if(run)frame_work((uint32_t)(uintptr_t)a);
     return NULL;
 }
 
@@ -266,29 +280,53 @@ for(size_t x=0;x<objects_len;x++)if(objects[x].len_of_connectors>=3){any_tris=tr
 if(any_tris){
     frame_objects=objects;
     frame_objects_len=objects_len;
-    if(!rasterization_pool_init(worker_count))return false;
+
+    // Spawn FIRST, size everything SECOND. pthread_create can fail under
+    // resource pressure, and the worker count is not a preference: the
+    // rasterizer splits each chunk into exactly that many contiguous ranges and
+    // the barrier waits for exactly that many arrivals. Sizing from the number
+    // we hoped for and then running with fewer means the missing ranges are
+    // never set up at all -- their triangles simply do not appear -- and their
+    // bins are never reset, so stale entries from an earlier chunk get drawn
+    // again. Hence the gate: the workers do not touch either until the count
+    // they were sized from is the count that exists.
+    pthread_mutex_lock(&gate_m);
+    gate_open=false;
+    gate_run=false;
+    pthread_mutex_unlock(&gate_m);
 
     pthread_t threads[64];
     uint32_t spawned=0;
     for(uint32_t i=1;i<worker_count;i++){
-        if(pthread_create(&threads[spawned],NULL,frame_worker,(void*)(uintptr_t)i)!=0)break;
+        if(pthread_create(&threads[spawned],NULL,frame_worker,(void*)(uintptr_t)(spawned+1))!=0)break;
         spawned++;
     }
-    // a thread that failed to start still has to be waited on by the barrier,
-    // so fall back to a barrier sized to what actually exists
-    if(spawned+1!=worker_count){
+    uint32_t live=spawned+1;           // the workers that exist, this thread included
+
+    bool ready=rasterization_pool_init(live);
+    if(ready){
         pthread_barrier_destroy(&frame_bar);
-        pthread_barrier_init(&frame_bar,NULL,spawned+1);
+        pthread_barrier_init(&frame_bar,NULL,live);
     }
 
-    frame_work(0);                     // this thread is worker 0
+    // release the gate whatever happened, or the spawned threads never exit
+    pthread_mutex_lock(&gate_m);
+    gate_open=true;
+    gate_run=ready;
+    pthread_cond_broadcast(&gate_c);
+    pthread_mutex_unlock(&gate_m);
+
+    if(ready)frame_work(0);            // this thread is worker 0
 
     for(uint32_t i=0;i<spawned;i++)pthread_join(threads[i],NULL);
 
-    if(spawned+1!=worker_count){
+    // put the barrier back to the size render_init chose, so the next frame
+    // starts from the same place this one did
+    if(ready&&live!=worker_count){
         pthread_barrier_destroy(&frame_bar);
         pthread_barrier_init(&frame_bar,NULL,worker_count);
     }
+    if(!ready)return false;
 }
 
 // present: the buffer just drawn becomes the one get_frame_buffer() hands out.

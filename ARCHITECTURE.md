@@ -604,6 +604,16 @@ costs tens of milliseconds and a keystroke should not.
        Would a split colour plane + depth plane be worth the churn? -->
 <!-- - band height is 16 rows. Smaller = better load balance, more bin entries per triangle.
        Has not been swept. -->
+<!-- MEASURED AND REJECTED, so nobody spends the afternoon again:
+       skipping the per-pixel divide when the fragment is already occluded.
+       75% of span pixels on woman_seated and 53% on the eco house are rejected
+       by the depth test right after paying for the divide, and the test can be
+       rearranged into 1/w space -- (dst->z - cam.z)*iw < 1 -- with no division
+       at all. It is a NET LOSS: 0.86x to 1.08x, slower on six of eight models.
+       The extra unpredictable branch costs more than x86's pipelined divider.
+       (The rearrangement also is not bit-exact, so it needs a 0.999 margin and
+       a fall-through to the exact test, which is what makes it a branch rather
+       than a substitution.) -->
 <!-- - the chunk loop is per OBJECT, so barriers scale with object count as well as
        triangle count: a 61-material model pays 61 x 3 barriers minimum. Making the
        chunk stream global across objects (storing the object on each SetupTri) would
