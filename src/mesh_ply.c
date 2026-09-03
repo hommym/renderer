@@ -12,6 +12,7 @@
 // that are easy to get half right on a truncated file.
 
 #include "mesh.h"
+#include "image.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -49,7 +50,7 @@ typedef struct Buf{ const uint8_t* p; size_t n; size_t at; } Buf;
 typedef struct Reader{ Buf b; PlyFormat fmt; bool bad_token; } Reader;
 
 // which property index carries what. NO_PROP when the file does not have it.
-typedef struct VertexMap{ size_t x,y,z,r,g,b,a; } VertexMap;
+typedef struct VertexMap{ size_t x,y,z,r,g,b,a,u,v; } VertexMap;
 
 
 // ---- small helpers -------------------------------------------------------
@@ -362,7 +363,7 @@ return r;
 // ---- element bodies ------------------------------------------------------
 
 static void build_vertex_map(const PlyElem* e,VertexMap* m){
-m->x=m->y=m->z=m->r=m->g=m->b=m->a=NO_PROP;
+m->x=m->y=m->z=m->r=m->g=m->b=m->a=m->u=m->v=NO_PROP;
 for(size_t i=0;i<e->len_of_props;i++){
     if(e->props[i].count_type!=PLY_NONE)continue;     // a coordinate list is nonsense
     const char* nm=e->props[i].name;
@@ -373,6 +374,11 @@ for(size_t i=0;i<e->len_of_props;i++){
     else if(m->g==NO_PROP&&(ieq(nm,"green")||ieq(nm,"g")))m->g=i;
     else if(m->b==NO_PROP&&(ieq(nm,"blue")||ieq(nm,"b")))m->b=i;
     else if(m->a==NO_PROP&&(ieq(nm,"alpha")||ieq(nm,"a")))m->a=i;
+    // ply has no standard name for texture coordinates; these are the four
+    // spellings the common exporters use. "u"/"v" are tested last so they cannot
+    // shadow anything above.
+    else if(m->u==NO_PROP&&(ieq(nm,"s")||ieq(nm,"texture_u")||ieq(nm,"texture_s")||ieq(nm,"u")))m->u=i;
+    else if(m->v==NO_PROP&&(ieq(nm,"t")||ieq(nm,"texture_v")||ieq(nm,"texture_t")||ieq(nm,"v")))m->v=i;
 }
 }
 
@@ -387,8 +393,9 @@ return (uint32_t)(v+0.5);
 
 static MeshResult read_vertices(Reader* rd,const PlyElem* e,const VertexMap* m,Vectex* v){
 bool has_colour=(m->r!=NO_PROP&&m->g!=NO_PROP&&m->b!=NO_PROP);
+bool has_uv=(m->u!=NO_PROP&&m->v!=NO_PROP);
 for(size_t i=0;i<(size_t)e->count;i++){
-    double x=0.0,y=0.0,z=0.0;
+    double x=0.0,y=0.0,z=0.0,tu=0.0,tv=0.0;
     uint32_t ch[4]={0,0,0,255};                       // r,g,b,a
     for(size_t j=0;j<e->len_of_props;j++){
         const PlyProp* p=&e->props[j];
@@ -406,13 +413,57 @@ for(size_t i=0;i<(size_t)e->count;i++){
         else if(j==m->g)ch[1]=chan_to_byte(val,p->type);
         else if(j==m->b)ch[2]=chan_to_byte(val,p->type);
         else if(j==m->a)ch[3]=chan_to_byte(val,p->type);
+        else if(j==m->u)tu=val;
+        else if(j==m->v)tv=val;
     }
     v[i].x=x;
     v[i].y=y;
     v[i].z=z;
+    v[i].u=has_uv?mesh_wrap_uv(tu):0.0f;
+    // ply inherits obj's bottom-left texture origin, so v is mirrored the same
+    // way. If a ply ever turns up textured upside down, this is the line.
+    v[i].v=has_uv?mesh_wrap_uv(1.0-tv):0.0f;
     v[i].colour=has_colour?((ch[3]<<24)|(ch[0]<<16)|(ch[1]<<8)|ch[2]):MESH_DEFAULT_COLOUR;
 }
 return MESH_OK;
+}
+
+// ply has no material block, so exporters record the model's image as a header
+// comment: "comment TextureFile wall.png". The header parser ignores comments
+// -- rightly, they carry no structure -- so it is picked out separately here.
+// Returns a malloc'd name, or NULL when the header has no such comment.
+static char* texture_comment(const uint8_t* data,size_t header_len){
+Buf hb={data,header_len,0};
+Buf line;
+char tok[PLY_TOKEN_MAX];
+while(next_line(&hb,&line)){
+    if(!tok_next(&line,tok,sizeof tok,NULL))continue;
+    if(!ieq(tok,"comment"))continue;
+    if(!tok_next(&line,tok,sizeof tok,NULL))continue;
+    if(!ieq(tok,"texturefile")&&!ieq(tok,"texturefile:"))continue;
+    if(!tok_next(&line,tok,sizeof tok,NULL))continue;
+    size_t n=strlen(tok);
+    char* name=malloc(n+1);
+    if(!name)return NULL;
+    memcpy(name,tok,n+1);
+    return name;
+}
+return NULL;
+}
+
+// Every vertex colour averaged into one. A ply usually carries colour per vertex
+// and no image at all, and the rasterizer only reads the texture -- so the flat
+// texture a colour-only ply falls back to is at least the right overall shade
+// rather than a default grey.
+static uint32_t average_colour(const Vectex* v,uint64_t n){
+if(!v||n==0)return MESH_DEFAULT_COLOUR;
+uint64_t r=0,g=0,b=0;
+for(uint64_t i=0;i<n;i++){
+    r+=(v[i].colour>>16)&0xFFu;
+    g+=(v[i].colour>>8)&0xFFu;
+    b+=v[i].colour&0xFFu;
+}
+return 0xFF000000u|((uint32_t)(r/n)<<16)|((uint32_t)(g/n)<<8)|(uint32_t)(b/n);
 }
 
 static bool push_tri(uint64_t** arr,size_t* len,size_t* cap,uint64_t a,uint64_t b,uint64_t c){
@@ -562,6 +613,23 @@ out->vertices=verts;
 out->len_of_vertices=vcount;
 out->connectors_sequence=tris;
 out->len_of_connectors=(uint64_t)n_conn;
+
+// b.at is where the header ended, so data[0..b.at) is exactly the header text
+char* texname=texture_comment(data,b.at);
+char* texpath=texname?mesh_path_sibling(path,texname):NULL;
+free(texname);
+Image img={0};
+bool textured=texpath&&image_decode_file(texpath,MESH_TEXTURE_MAX_DIM,&img,NULL,0);
+free(texpath);
+if(textured){
+    out->texture=img.pixels;
+    out->texture_width=img.width;
+    out->texture_height=img.height;
+}else if(!mesh_set_flat_texture(out,map.r!=NO_PROP?average_colour(verts,vcount):MESH_DEFAULT_COLOUR)){
+    *out=(Object){0};
+    r=MESH_ERR_OOM;
+    goto done;
+}
 verts=NULL;
 tris=NULL;
 r=MESH_OK;
@@ -571,6 +639,9 @@ free(verts);
 free(tris);
 free_elems(elems,nelems);
 free(data);
-if(r!=MESH_OK)*out=(Object){0};
+if(r!=MESH_OK){
+    free(out->texture);
+    *out=(Object){0};
+}
 return r;
 }

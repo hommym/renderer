@@ -1,5 +1,6 @@
 #include "mesh.h"
 #include "json.h"
+#include "image.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -34,6 +35,9 @@
 // in the file that no byte count bounds. cap it: otherwise a garbage "count":
 // 2^40 sizes a 32TB allocation off nothing.
 #define MAX_ZEROFILL_COUNT (1u<<22)
+// highest TEXCOORD_n a material may ask for. the spec sets no limit, but two
+// sets is what exporters actually emit and the name is built into a fixed buffer.
+#define MAX_UV_SET 7
 
 typedef struct Buf {
     const uint8_t* data;
@@ -54,6 +58,15 @@ typedef struct Accessor {
     bool normalized;
 } Accessor;
 
+// One material's share of the scene: its own vertex and index arrays, and which
+// image it wants sampled.
+typedef struct Bucket {
+    Vectex* verts;  size_t nverts, cap_verts;
+    uint64_t* idx;  size_t nidx,   cap_idx;
+    size_t   img;   bool   has_img;
+    uint32_t flat;                       // baseColorFactor, for when the image is unusable
+} Bucket;
+
 typedef struct Ctx {
     const JsonValue* root;
     const JsonValue* buffers;
@@ -61,6 +74,20 @@ typedef struct Ctx {
     const JsonValue* accessors;
     const JsonValue* meshes;
     const JsonValue* nodes;
+    const JsonValue* materials;
+    const JsonValue* textures;
+    const JsonValue* images;
+    // Object holds one texture but a glTF may name dozens, so the one that
+    // covers the most triangles wins. These tally that vote while the scene is
+    // walked; nothing is decoded until it is over.
+    size_t* img_tris; size_t nimages;
+    size_t* mat_tris; uint32_t* mat_flat; size_t nmaterials;
+    // geometry is accumulated per material rather than into one pile, because an
+    // Object carries one texture: a primitive drawn with material 7 has to end up
+    // in an Object whose texture is material 7's image, or its uv coordinates
+    // address the wrong picture. buckets[nmaterials] is the catch-all for
+    // primitives that name no material at all.
+    Bucket* buckets; size_t nbuckets;
     Buf* bufs; size_t nbufs;
     const uint8_t* bin; size_t bin_len;   // GLB BIN chunk, borrowed from the file image
     const char* dir; size_t dir_len;      // directory of the .gltf, for relative uris
@@ -421,11 +448,244 @@ static double acc_norm(const Accessor* a,size_t i,size_t k){
     return v>1.0?1.0:v;
 }
 
+// TEXCOORD_0 is FLOAT, or a normalized UBYTE/USHORT. acc_norm clamps to [0,1],
+// which is exactly right for the integer forms -- they cannot express anything
+// else -- and wrong for float, where a tiled uv of 3.5 is ordinary and clamping
+// it to 1.0 would collapse a whole repeat into one texel column.
+static double acc_uv(const Accessor* a,size_t i,size_t k){
+    return a->comp_type==CT_FLOAT?acc_raw(a,i,k):acc_norm(a,i,k);
+}
+
+static uint32_t chan8(double v){
+    if(!(v>0.0))return 0;          // negatives and NaN both floor here
+    if(v>=1.0)return 255;
+    return (uint32_t)(v*255.0+0.5);
+}
+
+static uint32_t pack_factor(const double f[4]){
+    return (chan8(f[3])<<24)|(chan8(f[0])<<16)|(chan8(f[1])<<8)|chan8(f[2]);
+}
+
 static uint32_t pack_colour(const Accessor* a,size_t i){
     double r=acc_norm(a,i,0),g=acc_norm(a,i,1),b=acc_norm(a,i,2);
     double al=a->ncomp>=4?acc_norm(a,i,3):1.0;   // VEC3 colour is opaque
     return ((uint32_t)(al*255.0+0.5)<<24)|((uint32_t)(r*255.0+0.5)<<16)
           |((uint32_t)(g*255.0+0.5)<<8)|(uint32_t)(b*255.0+0.5);
+}
+
+// ---- materials and textures ----------------------------------------------
+
+// The raw span a bufferView covers. accessor_resolve() does this too, but with
+// element striding on top; an embedded png or jpeg is just a byte range.
+static MeshResult view_bytes(Ctx* c,size_t vi,const uint8_t** data,size_t* len){
+    if(json_type(c->views)!=JSON_ARRAY||vi>=json_count(c->views))return MESH_ERR_FORMAT;
+    const JsonValue* view=json_at(c->views,vi);
+    if(json_type(view)!=JSON_OBJECT)return MESH_ERR_FORMAT;
+    size_t bi,off,ln;
+    if(!json_size(json_member(view,"buffer"),&bi))return MESH_ERR_FORMAT;
+    if(!json_size_opt(json_member(view,"byteOffset"),0,&off))return MESH_ERR_FORMAT;
+    if(!json_size(json_member(view,"byteLength"),&ln)||ln==0)return MESH_ERR_FORMAT;
+    const uint8_t* b;
+    size_t blen;
+    MeshResult r=buffer_get(c,bi,&b,&blen);
+    if(r!=MESH_OK)return r;
+    size_t end;
+    if(!sz_add(off,ln,&end)||end>blen)return MESH_ERR_FORMAT;
+    *data=b+off;*len=ln;
+    return MESH_OK;
+}
+
+// Decodes images[ii]. A missing, unreadable or unrecognised image is not a load
+// failure: the model still has geometry, and the caller falls back to a flat
+// colour. Only the three glTF spellings are handled -- a bufferView, a base64
+// data: uri, and a relative path next to the .gltf.
+static bool image_load(Ctx* c,size_t ii,Image* img){
+    *img=(Image){0};
+    if(json_type(c->images)!=JSON_ARRAY||ii>=json_count(c->images))return false;
+    const JsonValue* iv=json_at(c->images,ii);
+    if(json_type(iv)!=JSON_OBJECT)return false;
+
+    const JsonValue* bvv=json_member(iv,"bufferView");
+    if(bvv&&json_type(bvv)!=JSON_NULL){
+        size_t vi;
+        if(!json_size(bvv,&vi))return false;
+        const uint8_t* d;
+        size_t n;
+        if(view_bytes(c,vi,&d,&n)!=MESH_OK)return false;
+        return image_decode(d,n,MESH_TEXTURE_MAX_DIM,img,NULL,0);
+    }
+
+    const char* uri=json_member_string(iv,"uri",NULL);
+    if(!uri)return false;
+    if(strncmp(uri,"data:",5)==0){
+        const char* comma=strchr(uri,',');
+        if(!comma)return false;
+        size_t hdr=(size_t)(comma-uri);
+        if(hdr<7||strncmp(comma-7,";base64",7)!=0)return false;
+        uint8_t* raw=NULL;
+        size_t rn=0;
+        if(!b64_decode(comma+1,strlen(comma+1),&raw,&rn))return false;
+        bool ok=image_decode(raw,rn,MESH_TEXTURE_MAX_DIM,img,NULL,0);
+        free(raw);
+        return ok;
+    }
+
+    char* dec=uri_unescape(uri);
+    if(!dec)return false;
+    if(!uri_is_safe_relative(dec)){free(dec);return false;}
+    size_t nlen=strlen(dec),plen;
+    if(!sz_add(c->dir_len,nlen,&plen)||!sz_add(plen,1,&plen)){free(dec);return false;}
+    char* full=malloc(plen);
+    if(!full){free(dec);return false;}
+    memcpy(full,c->dir,c->dir_len);
+    memcpy(full+c->dir_len,dec,nlen+1);
+    free(dec);
+    bool ok=image_decode_file(full,MESH_TEXTURE_MAX_DIM,img,NULL,0);
+    free(full);
+    return ok;
+}
+
+// Which material a primitive uses, which image that material samples for base
+// colour, and the flat factor to fall back on. Returns false when the primitive
+// names no material -- glTF then says to draw it with the default material,
+// which is plain white.
+static bool prim_material(Ctx* c,const JsonValue* prim,size_t* mat,
+                          size_t* img,bool* has_img,uint32_t* flat,size_t* uvset){
+    *has_img=false;
+    *flat=0xFFFFFFFFu;
+    *uvset=0;
+    if(!json_size(json_member(prim,"material"),mat))return false;
+    if(json_type(c->materials)!=JSON_ARRAY||*mat>=json_count(c->materials))return false;
+    const JsonValue* pbr=json_member(json_at(c->materials,*mat),"pbrMetallicRoughness");
+
+    double f[4]={1.0,1.0,1.0,1.0};
+    const JsonValue* bcf=json_member(pbr,"baseColorFactor");
+    if(json_type(bcf)==JSON_ARRAY){
+        size_t n=json_count(bcf);
+        for(size_t k=0;k<4&&k<n;k++)f[k]=json_number(json_at(bcf,k),1.0);
+    }
+    *flat=pack_factor(f);
+
+    const JsonValue* bct=json_member(pbr,"baseColorTexture");
+    if(json_type(bct)!=JSON_OBJECT)return true;
+    // a material picks which uv set to sample with. baked lightmap exports
+    // routinely use TEXCOORD_1 for the baked atlas and keep TEXCOORD_0 for the
+    // tiling detail map, so reading set 0 unconditionally textures them with
+    // coordinates that belong to a different image entirely.
+    double tc=json_member_number(bct,"texCoord",0.0);
+    if(tc>=0.0&&tc<=(double)MAX_UV_SET)*uvset=(size_t)tc;
+    size_t ti;
+    if(!json_size(json_member(bct,"index"),&ti))return true;
+    if(json_type(c->textures)!=JSON_ARRAY||ti>=json_count(c->textures))return true;
+    size_t si;
+    if(!json_size(json_member(json_at(c->textures,ti),"source"),&si))return true;
+    *img=si;*has_img=true;
+    return true;
+}
+
+// Decodes each distinct image once. Several materials commonly point at one
+// atlas, and a 2048x2048 texture is 16MB, so decoding per material instead of
+// per image would multiply a 40-material model's memory by 40.
+typedef struct TexCache { size_t img; uint32_t* px; size_t w,h; } TexCache;
+
+// Turns the per-material buckets into a scene. Must run before ctx_dispose():
+// an embedded image still lives in a buffer that is about to be freed.
+static MeshResult build_scene(Ctx* c,Model* out){
+    size_t n=0;
+    for(size_t i=0;i<c->nbuckets;i++)if(c->buckets[i].nidx>=3)n++;
+    if(n==0)return MESH_ERR_EMPTY;
+
+    Object* objs=calloc(n,sizeof *objs);
+    uint32_t** texs=calloc(n,sizeof *texs);   // each object contributes at most one new one
+    TexCache* cache=calloc(c->nimages?c->nimages:1,sizeof *cache);
+    if(!objs||!texs||!cache){free(objs);free(texs);free(cache);return MESH_ERR_OOM;}
+
+    size_t ntex=0,ncache=0,k=0;
+    MeshResult r=MESH_OK;
+    for(size_t i=0;i<c->nbuckets;i++){
+        Bucket* b=&c->buckets[i];
+        if(b->nidx<3)continue;
+
+        Object* o=&objs[k];
+        o->vertices=b->verts;
+        o->len_of_vertices=b->nverts;
+        o->connectors_sequence=b->idx;
+        o->len_of_connectors=b->nidx;
+        b->verts=NULL;b->idx=NULL;             // ownership moves to the Object
+
+        uint32_t* px=NULL;
+        size_t w=0,h=0;
+        if(b->has_img){
+            bool hit=false;
+            for(size_t j=0;j<ncache;j++)
+                if(cache[j].img==b->img){px=cache[j].px;w=cache[j].w;h=cache[j].h;hit=true;break;}
+            if(!hit){
+                Image im={0};
+                if(image_load(c,b->img,&im)){px=im.pixels;w=im.width;h=im.height;texs[ntex++]=px;}
+                cache[ncache++]=(TexCache){.img=b->img,.px=px,.w=w,.h=h};
+            }
+        }
+        if(!px){
+            // no image, or one we could not decode: the material's flat base
+            // colour, so this object still has something to sample
+            Image im={0};
+            if(!image_solid(b->flat?b->flat:MESH_DEFAULT_COLOUR,&im)){r=MESH_ERR_OOM;break;}
+            px=im.pixels;w=im.width;h=im.height;
+            texs[ntex++]=px;
+        }
+        o->texture=px;o->texture_width=w;o->texture_height=h;
+        k++;
+    }
+    free(cache);
+
+    if(r!=MESH_OK){
+        for(size_t i=0;i<k;i++){free(objs[i].vertices);free(objs[i].connectors_sequence);}
+        for(size_t i=0;i<ntex;i++)free(texs[i]);
+        free(objs);free(texs);
+        return r;
+    }
+    out->objects=objs;out->len=k;
+    out->textures=texs;out->texture_count=ntex;
+    return MESH_OK;
+}
+
+// Flattens a scene back into one Object for mesh_load's single-object contract.
+// The dominant material's texture survives and the rest are freed -- which is
+// exactly the limitation mesh_load_scene exists to avoid.
+static MeshResult merge_scene(Model* sc,Object* out){
+    size_t nv=0,ni=0,best=0;
+    uint64_t bestn=0;
+    for(size_t i=0;i<sc->len;i++){
+        if(!sz_add(nv,sc->objects[i].len_of_vertices,&nv))return MESH_ERR_FORMAT;
+        if(!sz_add(ni,sc->objects[i].len_of_connectors,&ni))return MESH_ERR_FORMAT;
+        if(sc->objects[i].len_of_connectors>bestn){bestn=sc->objects[i].len_of_connectors;best=i;}
+    }
+    Vectex* V=malloc(nv*sizeof *V);
+    uint64_t* I=malloc(ni*sizeof *I);
+    if(!V||!I){free(V);free(I);return MESH_ERR_OOM;}
+
+    size_t vo=0,io=0;
+    for(size_t i=0;i<sc->len;i++){
+        Object* o=&sc->objects[i];
+        memcpy(V+vo,o->vertices,(size_t)o->len_of_vertices*sizeof *V);
+        // indices are bucket-local; concatenating the vertex arrays shifts them
+        for(uint64_t j=0;j<o->len_of_connectors;j++)I[io+j]=o->connectors_sequence[j]+vo;
+        vo+=(size_t)o->len_of_vertices;
+        io+=(size_t)o->len_of_connectors;
+    }
+
+    uint32_t* keep=sc->objects[best].texture;
+    out->texture=keep;
+    out->texture_width=sc->objects[best].texture_width;
+    out->texture_height=sc->objects[best].texture_height;
+    for(size_t i=0;i<sc->texture_count;i++)if(sc->textures[i]!=keep)free(sc->textures[i]);
+    for(size_t i=0;i<sc->len;i++){free(sc->objects[i].vertices);free(sc->objects[i].connectors_sequence);}
+    free(sc->objects);free(sc->textures);
+    *sc=(Model){0};
+
+    out->vertices=V;out->len_of_vertices=(uint64_t)nv;
+    out->connectors_sequence=I;out->len_of_connectors=(uint64_t)ni;
+    return MESH_OK;
 }
 
 // ---- node transforms -----------------------------------------------------
@@ -505,6 +765,33 @@ static MeshResult emit_primitive(Ctx* c,const JsonValue* prim,const double m[16]
         have_col=true;
     }
 
+    // the material decides which TEXCOORD_n to read, so it has to be settled
+    // before the attribute is looked up
+    size_t mat=0,img=0,uvset=0;
+    bool has_img=false;
+    uint32_t flat=0;
+    if(!prim_material(c,prim,&mat,&img,&has_img,&flat,&uvset)||mat>=c->nmaterials)
+        mat=c->nmaterials;                     // the catch-all bucket
+
+    Accessor uv;
+    bool have_uv=false;
+    char uvname[16];
+    snprintf(uvname,sizeof uvname,"TEXCOORD_%zu",uvset);
+    const JsonValue* tv=json_member(attrs,uvname);
+    // a material naming a set the mesh does not carry is malformed; set 0 is a
+    // better guess than no texture at all
+    if(!tv||json_type(tv)==JSON_NULL)tv=json_member(attrs,"TEXCOORD_0");
+    if(tv&&json_type(tv)!=JSON_NULL){
+        size_t ti;
+        if(!json_size(tv,&ti))return MESH_ERR_FORMAT;
+        r=accessor_resolve(c,ti,&uv);
+        if(r!=MESH_OK)return r;
+        if(uv.ncomp!=2)return MESH_ERR_FORMAT;
+        // the spec allows exactly these three; anything else is a broken file
+        if(uv.comp_type!=CT_FLOAT&&uv.comp_type!=CT_UBYTE&&uv.comp_type!=CT_USHORT)return MESH_ERR_FORMAT;
+        have_uv=true;
+    }
+
     Accessor ind;
     bool have_ind=false;
     const JsonValue* iv=json_member(prim,"indices");
@@ -521,16 +808,20 @@ static MeshResult emit_primitive(Ctx* c,const JsonValue* prim,const double m[16]
     size_t tri_count=have_ind?ind.count:pos.count;
     if(tri_count%3)return MESH_ERR_FORMAT;     // a triangle list is always a multiple of 3
 
-    size_t base=c->nverts,vneed,ineed;
-    if(!sz_add(base,pos.count,&vneed))return MESH_ERR_FORMAT;
-    if(!sz_add(c->nidx,tri_count,&ineed))return MESH_ERR_FORMAT;
+    Bucket* bk=&c->buckets[mat];
+    if(has_img&&img<c->nimages){ bk->img=img; bk->has_img=true; }
+    if(flat)bk->flat=flat;
 
-    Vectex* nv=grow_arr(c->verts,&c->cap_verts,vneed,sizeof *c->verts);
+    size_t base=bk->nverts,vneed,ineed;
+    if(!sz_add(base,pos.count,&vneed))return MESH_ERR_FORMAT;
+    if(!sz_add(bk->nidx,tri_count,&ineed))return MESH_ERR_FORMAT;
+
+    Vectex* nv=grow_arr(bk->verts,&bk->cap_verts,vneed,sizeof *bk->verts);
     if(!nv)return MESH_ERR_OOM;
-    c->verts=nv;
-    uint64_t* ni=grow_arr(c->idx,&c->cap_idx,ineed,sizeof *c->idx);
+    bk->verts=nv;
+    uint64_t* ni=grow_arr(bk->idx,&bk->cap_idx,ineed,sizeof *bk->idx);
     if(!ni)return MESH_ERR_OOM;
-    c->idx=ni;
+    bk->idx=ni;
 
     for(size_t i=0;i<pos.count;i++){
         double x=acc_raw(&pos,i,0),y=acc_raw(&pos,i,1),z=acc_raw(&pos,i,2);
@@ -542,7 +833,16 @@ static MeshResult emit_primitive(Ctx* c,const JsonValue* prim,const double m[16]
         if(!isfinite(v.x)||!isfinite(v.y)||!isfinite(v.z))return MESH_ERR_FORMAT;
         // a short COLOR_0 is padded rather than rejected: the geometry is still good
         v.colour=(have_col&&i<col.count)?pack_colour(&col,i):MESH_DEFAULT_COLOUR;
-        c->verts[base+i]=v;
+        // a mesh with no TEXCOORD_0 gets (0,0), which reads the top-left texel.
+        // that is deliberate: its texture is the 1x1 flat fallback, where every
+        // coordinate is the same texel anyway.
+        if(have_uv&&i<uv.count){
+            v.u=mesh_wrap_uv(acc_uv(&uv,i,0));
+            v.v=mesh_wrap_uv(acc_uv(&uv,i,1));
+        }else{
+            v.u=0.0f;v.v=0.0f;
+        }
+        bk->verts[base+i]=v;
     }
 
     for(size_t i=0;i<tri_count;i++){
@@ -552,11 +852,19 @@ static MeshResult emit_primitive(Ctx* c,const JsonValue* prim,const double m[16]
             if(!(d>=0.0)||d>=(double)pos.count)return MESH_ERR_FORMAT;
             vi=(size_t)d;
         }else vi=i;                            // no indices: vertices are triangles in order
-        c->idx[c->nidx+i]=(uint64_t)(base+vi);
+        bk->idx[bk->nidx+i]=(uint64_t)(base+vi);
     }
 
-    c->nverts=vneed;
-    c->nidx=ineed;
+    if(mat<c->nmaterials){
+        c->mat_tris[mat]+=tri_count/3;
+        c->mat_flat[mat]=flat;
+    }
+    if(has_img&&img<c->nimages)c->img_tris[img]+=tri_count/3;
+
+    bk->nverts=vneed;
+    bk->nidx=ineed;
+    c->nverts+=pos.count;                      // scene totals, for the empty check
+    c->nidx+=tri_count;
     return MESH_OK;
 }
 
@@ -677,9 +985,17 @@ static void ctx_dispose(Ctx* c){
         free(c->bufs);
     }
     free(c->visited);
+    free(c->img_tris);
+    free(c->mat_tris);
+    free(c->mat_flat);
+    if(c->buckets){
+        // NULL for anything build_scene already took ownership of
+        for(size_t i=0;i<c->nbuckets;i++){free(c->buckets[i].verts);free(c->buckets[i].idx);}
+        free(c->buckets);
+    }
 }
 
-MeshResult mesh_load_gltf(const char* path,Object* out){
+static MeshResult load_gltf_scene(const char* path,Model* out){
     if(!out)return MESH_ERR_FORMAT;
     memset(out,0,sizeof *out);
     if(!path)return MESH_ERR_OPEN;
@@ -717,8 +1033,13 @@ MeshResult mesh_load_gltf(const char* path,Object* out){
     c.accessors=json_member(c.root,"accessors");
     c.meshes=json_member(c.root,"meshes");
     c.nodes=json_member(c.root,"nodes");
+    c.materials=json_member(c.root,"materials");
+    c.textures=json_member(c.root,"textures");
+    c.images=json_member(c.root,"images");
     c.nbufs=json_type(c.buffers)==JSON_ARRAY?json_count(c.buffers):0;
     c.nnodes=json_type(c.nodes)==JSON_ARRAY?json_count(c.nodes):0;
+    c.nmaterials=json_type(c.materials)==JSON_ARRAY?json_count(c.materials):0;
+    c.nimages=json_type(c.images)==JSON_ARRAY?json_count(c.images):0;
 
     // the .gltf's own directory, kept with its trailing separator so a relative
     // uri is just a concatenation away
@@ -737,27 +1058,47 @@ MeshResult mesh_load_gltf(const char* path,Object* out){
         c.visited=calloc(c.nnodes,sizeof *c.visited);
         if(!c.visited)r=MESH_ERR_OOM;
     }
+    if(r==MESH_OK&&c.nmaterials){
+        c.mat_tris=calloc(c.nmaterials,sizeof *c.mat_tris);
+        c.mat_flat=calloc(c.nmaterials,sizeof *c.mat_flat);
+        if(!c.mat_tris||!c.mat_flat)r=MESH_ERR_OOM;
+    }
+    if(r==MESH_OK&&c.nimages){
+        c.img_tris=calloc(c.nimages,sizeof *c.img_tris);
+        if(!c.img_tris)r=MESH_ERR_OOM;
+    }
+    if(r==MESH_OK){
+        // one bucket per material plus the catch-all for primitives with none
+        c.nbuckets=c.nmaterials+1;
+        c.buckets=calloc(c.nbuckets,sizeof *c.buckets);
+        if(!c.buckets)r=MESH_ERR_OOM;
+    }
     if(r==MESH_OK)r=walk_scene(&c);
     if(r==MESH_OK&&(c.nidx==0||c.nverts==0))r=MESH_ERR_EMPTY;
+    // before ctx_dispose: an embedded texture lives in a buffer it is about to free
+    if(r==MESH_OK)r=build_scene(&c,out);
 
     ctx_dispose(&c);
     json_free(doc);
     free(file);
+    if(r!=MESH_OK)memset(out,0,sizeof *out);
+    return r;
+}
+
+MeshResult mesh_load_gltf_scene(const char* path,Model* out){
+    return load_gltf_scene(path,out);
+}
+
+MeshResult mesh_load_gltf(const char* path,Object* out){
+    if(!out)return MESH_ERR_FORMAT;
+    memset(out,0,sizeof *out);
+    Model sc={0};
+    MeshResult r=load_gltf_scene(path,&sc);
+    if(r!=MESH_OK)return r;
+    r=merge_scene(&sc,out);
     if(r!=MESH_OK){
-        free(c.verts);
-        free(c.idx);
-        return r;
+        mesh_model_free(&sc);
+        memset(out,0,sizeof *out);
     }
-
-    // hand back exactly what was used; a failed shrink is not a failure
-    Vectex* sv=realloc(c.verts,c.nverts*sizeof *c.verts);
-    if(sv)c.verts=sv;
-    uint64_t* si=realloc(c.idx,c.nidx*sizeof *c.idx);
-    if(si)c.idx=si;
-
-    out->vertices=c.verts;
-    out->len_of_vertices=(uint64_t)c.nverts;
-    out->connectors_sequence=c.idx;
-    out->len_of_connectors=(uint64_t)c.nidx;
-    return MESH_OK;
+    return r;
 }
