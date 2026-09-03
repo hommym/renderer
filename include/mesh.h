@@ -87,6 +87,10 @@ typedef struct Model {
     // them and mesh_model_free releases them; nothing here needs touching.
     uint32_t** textures;
     size_t     texture_count;
+    // Primitives the loader could not draw and dropped: point/line primitives,
+    // morph targets, Draco-compressed geometry. Non-zero means what you are
+    // looking at is a PART of the file. Zero for every other format.
+    uint64_t   primitives_skipped;
 } Model;
 
 // Detects the format, parses it, splits it by material, decodes its textures,
@@ -172,6 +176,21 @@ float mesh_wrap_uv(double t);
 // a malloc'd path the caller frees.
 bool  mesh_path_is_safe(const char* rel);
 char* mesh_path_sibling(const char* base_path, const char* rel);
+
+// What a loader should actually call for a texture reference. mesh_path_sibling
+// alone rejects anything that is not already a sibling, and exporters routinely
+// write an absolute path that was only ever valid on the machine that made the
+// file -- "map_Kd C:/Users/.../Textures/wall.png". Those are not siblings, so
+// the texture was being dropped and the model rendered flat.
+//
+// So: try the path as written, and if that is not a safe sibling, retry with
+// just its last component. The basename retry is still resolved against
+// base_path's directory, so it cannot escape it -- the security property
+// mesh_path_is_safe exists for is unchanged.
+//
+// Returns a malloc'd path the caller frees, or NULL if neither form resolves to
+// a file that exists.
+char* mesh_texture_sibling(const char* base_path, const char* rel);
 
 // Replaces obj's texture with a 1x1 image of one colour. This is what a file
 // with no usable image gets, so that the rasterizer always has something to

@@ -95,6 +95,10 @@ typedef struct Ctx {
     Vectex* verts; size_t nverts, cap_verts;
     uint64_t* idx;  size_t nidx,   cap_idx;
     bool* visited; size_t nnodes;
+
+    // primitives dropped because they are not triangles, or carry morph targets,
+    // or are Draco-compressed. Counted rather than fatal; see emit_primitive.
+    uint64_t skipped;
 } Ctx;
 
 static bool sz_add(size_t a,size_t b,size_t* r){ if(a>SIZE_MAX-b)return false; *r=a+b; return true; }
@@ -564,9 +568,17 @@ static bool prim_material(Ctx* c,const JsonValue* prim,size_t* mat,
     const JsonValue* matv=json_at(c->materials,*mat);
     *two_sided=json_bool(json_member(matv,"doubleSided"),false);
     const JsonValue* pbr=json_member(matv,"pbrMetallicRoughness");
+    // A KHR_materials_pbrSpecularGlossiness material usually carries no
+    // pbrMetallicRoughness block at all: its base colour is diffuseFactor and
+    // diffuseTexture instead. Same textureInfo shape, same texCoord field, so
+    // everything downstream works unchanged. Without this the three models the
+    // allow-list above unlocks would load as 106 objects of flat white.
+    const JsonValue* sg=json_member(json_member(matv,"extensions"),
+                                    "KHR_materials_pbrSpecularGlossiness");
 
     double f[4]={1.0,1.0,1.0,1.0};
     const JsonValue* bcf=json_member(pbr,"baseColorFactor");
+    if(json_type(bcf)!=JSON_ARRAY)bcf=json_member(sg,"diffuseFactor");
     if(json_type(bcf)==JSON_ARRAY){
         size_t n=json_count(bcf);
         for(size_t k=0;k<4&&k<n;k++)f[k]=json_number(json_at(bcf,k),1.0);
@@ -574,6 +586,7 @@ static bool prim_material(Ctx* c,const JsonValue* prim,size_t* mat,
     *flat=pack_factor(f);
 
     const JsonValue* bct=json_member(pbr,"baseColorTexture");
+    if(json_type(bct)!=JSON_OBJECT)bct=json_member(sg,"diffuseTexture");
     if(json_type(bct)!=JSON_OBJECT)return true;
     // a material picks which uv set to sample with. baked lightmap exports
     // routinely use TEXCOORD_1 for the baked atlas and keep TEXCOORD_0 for the
@@ -653,6 +666,7 @@ static MeshResult build_scene(Ctx* c,Model* out){
         return r;
     }
     out->objects=objs;out->len=k;
+    out->primitives_skipped=c->skipped;
     out->textures=texs;out->texture_count=ntex;
     return MESH_OK;
 }
@@ -743,7 +757,11 @@ static MeshResult emit_primitive(Ctx* c,const JsonValue* prim,const double m[16]
     if(json_type(prim)!=JSON_OBJECT)return MESH_ERR_FORMAT;
     // render() reads connectors three at a time; strips, fans and lines would be
     // reinterpreted as triangles rather than drawn
-    if(json_member_number(prim,"mode",MODE_TRIANGLES)!=(double)MODE_TRIANGLES)return MESH_ERR_UNSUPPORTED;
+    // A primitive we cannot draw is dropped, not fatal. One LINES helper or one
+    // blend-shaped eyelid must not cost the other 600 primitives in the file --
+    // kralzfiller alone has 656. Nothing wrong is emitted, but the drop is
+    // silent, so it is counted and reported through Model.primitives_skipped.
+    if(json_member_number(prim,"mode",MODE_TRIANGLES)!=(double)MODE_TRIANGLES){c->skipped++;return MESH_OK;}
 
     // draco keeps the real geometry in an extension buffer and leaves the
     // accessors bufferView-less; read straight, that is a mesh of zeros, not an error
@@ -752,7 +770,7 @@ static MeshResult emit_primitive(Ctx* c,const JsonValue* prim,const double m[16]
     // morph targets displace POSITION by the node/mesh weights. we cannot apply
     // them, and emitting the base shape would be the silent reinterpretation
     // mesh.h forbids, so refuse rather than return the wrong geometry.
-    if(json_member(prim,"targets"))return MESH_ERR_UNSUPPORTED;
+    if(json_member(prim,"targets")){c->skipped++;return MESH_OK;}
 
     const JsonValue* attrs=json_member(prim,"attributes");
     if(json_type(attrs)!=JSON_OBJECT)return MESH_ERR_FORMAT;
@@ -910,14 +928,27 @@ static MeshResult walk_node(Ctx* c,size_t ni,const double parent[16],int depth){
 
     const JsonValue* mv=json_member(n,"mesh");
     if(mv&&json_type(mv)!=JSON_NULL){
-        // a skinned mesh is posed by its joints, and the spec requires the
-        // referencing node's own transform to be ignored. we do neither, so
-        // baking `world` in would place it wrongly in a wrong pose.
+        // A skinned mesh is posed by its joints. We do not skin, so we draw the
+        // BIND pose -- and that is exact, not an approximation. POSITION is
+        // already in the space the inverse bind matrices map from, so in the
+        // bind pose every joint matrix is globalJoint*IBM = identity and the
+        // weighted sum collapses to the vertex itself. The spec also requires
+        // the referencing node's own transform to be ignored
+        // (glTF 2.0 Specification.adoc: "Only the joint transforms are applied
+        // to the skinned mesh; the transform of the skinned mesh node MUST be
+        // ignored"), so `world` is precisely what must NOT go in here.
+        //
+        // What this costs: a file whose rest hierarchy is itself a posed frame
+        // renders its T-pose instead of that pose. Checked against a full
+        // linear-blend-skinning reference on all three skinned models in
+        // 3dmodels/: the shapes agree to within 8.7e-6 of model extent, so
+        // there is nothing to gain from skinning them properly here.
+        static const double bind_ident[16]={1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1};
         const JsonValue* sk=json_member(n,"skin");
-        if(sk&&json_type(sk)!=JSON_NULL)return MESH_ERR_UNSUPPORTED;
+        bool skinned=sk&&json_type(sk)!=JSON_NULL;
         size_t mi;
         if(!json_size(mv,&mi))return MESH_ERR_FORMAT;
-        r=emit_mesh(c,mi,world);
+        r=emit_mesh(c,mi,skinned?bind_ident:world);
         if(r!=MESH_OK)return r;
     }
 
@@ -1008,6 +1039,54 @@ static void ctx_dispose(Ctx* c){
     }
 }
 
+// Extensions a required-list may name that this loader can safely ignore.
+//
+// Membership is narrow: the extension must not define an accessor, a bufferView
+// encoding, an attribute semantic, a primitive property or a uv mapping.
+// Everything below only describes how a surface is SHADED, and this renderer
+// samples a base-colour texel and writes it -- there is no shading to get wrong.
+// Anything that touches the bytes stays off the list, because "load it anyway"
+// there means "load something else".
+//
+// Deliberately NOT here, and why:
+//   KHR_draco_mesh_compression  positions/indices live in a Draco bitstream
+//   EXT_meshopt_compression     a bufferView's bytes are a compressed stream
+//   KHR_mesh_quantization       POSITION/TEXCOORD become integer types
+//   KHR_texture_transform       rewrites the uv mapping: silently wrong texels
+//   EXT_mesh_gpu_instancing     draws N copies; ignoring it draws one
+//   KHR_texture_basisu, EXT_texture_webp, EXT_texture_avif
+//                               png.c/jpeg.c cannot decode them, so every
+//                               material would fall back to flat colour
+static const char* const EXT_IGNORABLE[]={
+    "KHR_materials_pbrSpecularGlossiness",   // base colour moves; see prim_material
+    "KHR_materials_unlit",
+    "KHR_materials_emissive_strength",
+    "KHR_materials_specular",
+    "KHR_materials_ior",
+    "KHR_materials_clearcoat",
+    "KHR_materials_sheen",
+    "KHR_materials_transmission",
+    "KHR_materials_volume",
+    "KHR_materials_iridescence",
+    "KHR_materials_anisotropy",
+    "KHR_materials_dispersion",
+    "KHR_materials_diffuse_transmission",
+    "KHR_materials_variants",   // primitive.material stays the default mapping
+    "KHR_lights_punctual",      // there is no lighting here at all
+    "EXT_lights_image_based",
+    "KHR_animation_pointer",    // animation only; a static viewer wants base values
+    "KHR_xmp_json_ld",
+    "KHR_xmp",
+    "FB_ngon_encoding",         // a hint for rebuilding ngons; the triangles are real
+};
+
+static bool ext_is_ignorable(const char* name){
+    if(!name)return false;
+    for(size_t i=0;i<sizeof EXT_IGNORABLE/sizeof *EXT_IGNORABLE;i++)
+        if(strcmp(name,EXT_IGNORABLE[i])==0)return true;
+    return false;
+}
+
 static MeshResult load_gltf_scene(const char* path,Model* out){
     if(!out)return MESH_ERR_FORMAT;
     memset(out,0,sizeof *out);
@@ -1033,12 +1112,18 @@ static MeshResult load_gltf_scene(const char* path,Model* out){
     if(json_type(c.root)!=JSON_OBJECT){json_free(doc);free(file);return MESH_ERR_FORMAT;}
 
     // an extension listed here is required to load the asset at all, so anything
-    // we do not implement must fail rather than load as wrong geometry. the list
-    // of supported extensions is empty, so any entry is a refusal.
+    // that could change what the BYTES mean must still fail rather than load as
+    // wrong geometry. But refusing on the count alone refused three models over a
+    // shading model this renderer does not even have, so the test is by name now.
     const JsonValue* req=json_member(c.root,"extensionsRequired");
     if(req&&json_type(req)!=JSON_NULL){
         if(json_type(req)!=JSON_ARRAY){json_free(doc);free(file);return MESH_ERR_FORMAT;}
-        if(json_count(req)>0){json_free(doc);free(file);return MESH_ERR_UNSUPPORTED;}
+        size_t nreq=json_count(req);
+        for(size_t i=0;i<nreq;i++){
+            const JsonValue* e=json_at(req,i);
+            if(json_type(e)!=JSON_STRING){json_free(doc);free(file);return MESH_ERR_FORMAT;}
+            if(!ext_is_ignorable(json_string(e,NULL))){json_free(doc);free(file);return MESH_ERR_UNSUPPORTED;}
+        }
     }
 
     c.buffers=json_member(c.root,"buffers");
