@@ -110,7 +110,6 @@ void render_init(Object* objs,uint64_t len,uint32_t win_w,uint32_t win_h);
 // reallocated or replaced. The renderer never grows, copies or frees it.
 void set_objects(Object* objs,uint64_t len);
 bool render();
-void clear_frame_buffer(bool keep_frame);
 void renderer_resize(uint32_t win_w,uint32_t win_h);
 // Movement is relative to where the camera is looking: MOV_FORWARD follows the
 // gaze including pitch, MOV_LEFT/RIGHT strafe along the horizontal right axis,
@@ -131,7 +130,24 @@ void move_camera(double unit,Movement direction);
 // vertical the horizontal heading is undefined and the view rolls.
 void rotate_camera(double d_yaw,double d_pitch);
 Camera get_camera_pos();
-void* get_frame_buffer();
+// ---- frame buffers -------------------------------------------------------
+//
+// There are two, and the renderer owns both. They are allocated once by
+// render_init() and again by renderer_resize(), and never per frame: nothing
+// outside src/renderer.c can create, resize or release one.
+//
+// render() wipes the back buffer, draws into it, and swaps at the end. So the
+// pointer below is always a COMPLETE frame -- the one before the frame currently
+// being drawn -- and it stays valid until the next render() or resize.
+//
+// const on purpose. It used to be a void* handed out of a buffer that the next
+// clear freed, which meant any caller holding it across a frame was reading
+// memory that had already been released.
+const PixelCord* get_frame_buffer();
+
+// The buffer being drawn into, for the rasterization workers only. Not part of
+// the interface a caller should reach for: it is a half-finished frame.
+PixelCord* renderer_back_buffer();
 Object* get_current_object();
 
 

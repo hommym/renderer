@@ -81,7 +81,7 @@ Only the triangle path is threaded. The point-cloud path runs on the calling thr
 
 **`Vectex`** — world-space position (`x`,`y`,`z`), a texture coordinate (`u`,`v`), and a 32-bit colour. The input format.
 
-`u` and `v` are the drawn colour; `colour` is not (`issues.md` §9). Both must lie in `[0,1)` — the rasterizer turns them into array subscripts with no bounds check, so `1.0` is one texel past the end. `mesh.h` makes that part of the load contract.
+`u` and `v` are the drawn colour; `colour` is not (`issues.md` §8). Both must lie in `[0,1)` — the rasterizer turns them into array subscripts with no bounds check, so `1.0` is one texel past the end. `mesh.h` makes that part of the load contract.
 
 **`PixelCord`** — screen-space position (`px`,`py`), the world-space depth `z` it came from, its texture coordinate, its resolved colour, and two flags. Serves three roles: a projected vertex, one step along a Bresenham strip, and a frame-buffer cell.
 
@@ -90,7 +90,7 @@ Only the triangle path is threaded. The point-cloud path runs on the calling thr
 
 **`Object`** — `vertices[]` plus a flat `connectors_sequence[]` of indices into it, read three at a time, plus one texture (`texture`, `texture_width`, `texture_height`) shared by every vertex. `len_of_connectors == 0` means point cloud.
 
-`texture` is dereferenced unconditionally by both draw paths, so it is never allowed to be NULL: an object with no image gets a 1x1 texture of its flat colour instead. One texture per object is also the whole multi-material limitation (`issues.md` §11).
+`texture` is dereferenced unconditionally by both draw paths, so it is never allowed to be NULL: an object with no image gets a 1x1 texture of its flat colour instead. One texture per object is also the whole multi-material limitation (`issues.md` §10).
 
 **`Camera`** — axis-aligned frustum: position `(x,y,z)`, far-plane extents `(x_end,y_end,z_end)`, and lens fields `focal_l`, `v_fov`, `h_fov`. No rotation (`issues.md` §4).
 
@@ -166,7 +166,7 @@ concept, so they are treated as double sided: "we cannot tell" has to mean "do
 not throw geometry away".
 
 `set_backface_cull_forced(true)` overrides the flag for the cases where an
-exporter set it by default on a mesh that does not need it. `issues.md` 12 has
+exporter set it by default on a mesh that does not need it. `issues.md` 11 has
 the measured cost per model.
 
 ---
@@ -246,12 +246,32 @@ Colour is resolved last, per pixel: the span lerp carries `u`/`v`, and `texture[
 
 ## 9. Frame buffer ownership
 
-- Allocated by `create_frame_buffer(w,h)` with `calloc`, stored as `void* frame`.
-- Reinterpreted as `PixelCord (*)[screen_width]` inside `render()` and `rasterizer()`; as a flat `PixelCord*` inside `update_win()`.
-- Never cleared per frame automatically — callers call `clear_frame_buffer(false)` (currently `renderer_resize` and the event handlers).
-- Depth arbitration is the `.in_use` + `.z` compare at each write site. There is no separate depth array.
-- `update_win` flattens it to ARGB: `.in_use` cells paint their own colour, empty cells paint white.
-- `Object.vertices`, `Object.connectors_sequence` and `Object.texture` are owned by whoever created the `Object`; the renderer never frees them.
+**Two buffers, both owned by `src/renderer.c`, and nothing outside that file can
+create, resize or release either one.**
+
+- Allocated in exactly two places: `render_init()` and `renderer_resize()`. Never
+  per frame.
+- `render()` wipes the back buffer with `memset`, draws into it, and swaps at the
+  end. The swap is a pointer flip; nothing is copied.
+- `get_frame_buffer()` returns a `const PixelCord*` to the FRONT buffer -- always
+  a complete frame, valid until the next `render()` or resize.
+- `renderer_back_buffer()` returns the mutable half-drawn frame, for the
+  rasterization workers only.
+- `update_win` flattens the front buffer to ARGB: `.in_use` cells composite their
+  own colour over the background by its alpha, empty cells paint the background.
+- Depth arbitration is the `.in_use` + `.z` compare at each write site. There is
+  no separate depth array.
+
+This replaced a single buffer that was freed and `calloc`'d again *every frame*.
+That was two problems in one. It was 60MB released and 60MB zero-filled per frame
+at 1500x1000 -- worth 28% of the eco house's frame time and 47% of the zbrush
+mech's, since the fixed allocation cost dominates a light scene. And it handed
+out a raw `void*` that the next clear silently invalidated, so any caller holding
+the result of `get_frame_buffer()` across a frame was reading freed memory.
+
+Neither buffer is released at shutdown. They are reachable from a static for the
+life of the process, which is deliberate: there is no teardown path, and freeing
+them at exit would only give the allocator work to do on the way out.
 
 ### Scene list
 
@@ -355,9 +375,9 @@ A texture path read out of a model file is resolved against that file's own dire
 - No wireframe rendering. Dropped deliberately when rasterization moved to `rasterization.c`; the Bresenham walker remains as a triangle-edge utility.
 - No explicit primitive tag on `Object` — dispatch infers it from connector count, and nothing records indices-per-primitive.
 - No texture filtering. Sampling is nearest-neighbour at the texel the truncated `u`/`v` lands on; no bilinear, no mipmaps, so a minified texture aliases.
-- No texture wrap or clamp at the sample site — the `[0,1)` invariant is held by the loaders (`issues.md` §8).
+- No texture wrap or clamp at the sample site — the `[0,1)` invariant is held by the loaders (`issues.md` §7).
 - One texture per `Object`. Multi-material files are split into several Objects (`mesh_load_scene`) rather than the renderer growing multi-texture support.
-- No alpha. The decoders keep the channel and the frame buffer carries it, but nothing tests it, so a cutout texture paints as a solid card (`issues.md` §11).
+- No alpha. The decoders keep the channel and the frame buffer carries it, but nothing tests it, so a cutout texture paints as a solid card (`issues.md` §10).
 - No lighting, so glTF `NORMAL` and OBJ `vn` are parsed past rather than stored.
 
 ---

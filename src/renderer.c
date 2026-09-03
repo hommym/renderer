@@ -5,6 +5,7 @@
 #include "interpolation.h"
 #include "rasterization.h"
 #include "transform.h"
+#include <string.h>
 
 
 
@@ -32,7 +33,17 @@ static Object* objects=NULL;
 static Object* object;
 _Atomic size_t triangle_tracker;
 static size_t objects_len=0;
-static void* frame=NULL;
+// Two frame buffers, allocated once per window size and owned entirely by this
+// file. render() draws into the back one and swaps at the end; everyone else
+// gets a const pointer to the front one and cannot allocate or release either.
+//
+// Before this they were freed and calloc'd again every single frame. At 1500x1000
+// that is a 60MB release and a 60MB zeroed allocation per frame, and it handed
+// out a pointer that the next clear silently invalidated -- anything that held
+// on to the result of get_frame_buffer() across a frame was reading freed memory.
+static PixelCord* buffers[2]={NULL,NULL};
+static size_t buffer_cells=0;
+static int back=0;                 // buffers[back] is the one being drawn into
 static int num_core=0; // number of cores the running system has
 
 
@@ -72,8 +83,33 @@ static void setup_camera(){
 }
 
 
-static void create_frame_buffer(uint32_t win_w,uint32_t win_h){
-frame= calloc((win_h*win_w),sizeof(PixelCord));
+static void frame_buffers_release(void){
+free(buffers[0]);
+free(buffers[1]);
+buffers[0]=NULL;
+buffers[1]=NULL;
+buffer_cells=0;
+}
+
+// The only place either buffer is ever allocated. Called at init and on resize,
+// never per frame.
+static bool frame_buffers_alloc(uint32_t win_w,uint32_t win_h){
+frame_buffers_release();
+if(win_w==0||win_h==0)return false;
+size_t cells=(size_t)win_w*(size_t)win_h;
+if(win_w&&cells/win_w!=win_h)return false;                 // the multiply wrapped
+if(cells>SIZE_MAX/sizeof(PixelCord))return false;
+buffers[0]=calloc(cells,sizeof(PixelCord));
+buffers[1]=calloc(cells,sizeof(PixelCord));
+if(!buffers[0]||!buffers[1]){
+    // one of the two is no use on its own, and a half-allocated pair would let
+    // the swap hand out NULL every other frame
+    frame_buffers_release();
+    return false;
+}
+buffer_cells=cells;
+back=0;
+return true;
 }
 
 
@@ -85,8 +121,13 @@ return camera;
 
 
 
-void* get_frame_buffer(){
-    return frame;
+const PixelCord* get_frame_buffer(){
+    // the front buffer: the last frame render() finished and swapped in
+    return buffers[back^1];
+}
+
+PixelCord* renderer_back_buffer(){
+    return buffers[back];
 }
 
 // Point the renderer at the caller's object array. The renderer only reads it:
@@ -103,7 +144,7 @@ void render_init(Object* objs,uint64_t len,uint32_t win_w,uint32_t win_h){
 // needs to be called once to initialise the renderer
 num_core=get_number_of_cores(); // loading the number of core on system to know number of threads to spawn
 num_core=num_core<0?1:num_core-1;
-create_frame_buffer(win_w,win_h);
+frame_buffers_alloc(win_w,win_h);
 set_objects(objs,len);
 screen_width=win_w;
 screen_hieght=win_h;
@@ -112,13 +153,18 @@ setup_camera();
 
 
 bool render(){
-if(frame==NULL)return false;
+if(buffers[0]==NULL||buffers[1]==NULL)return false;
 
 // rebuild the camera basis once for the whole frame. every vertex is rotated
 // into view space with it, and the rasterization threads only read it.
 view_refresh();
 
-PixelCord (*frame_buffer)[screen_width]= (PixelCord (*)[screen_width])frame;   
+// Wipe the back buffer rather than reallocating it. .in_use is the occupancy
+// bit, so zeroing is what makes every cell empty again; the front buffer is
+// untouched and keeps showing the last finished frame while this one is drawn.
+memset(buffers[back],0,buffer_cells*sizeof(PixelCord));
+
+PixelCord (*frame_buffer)[screen_width]= (PixelCord (*)[screen_width])buffers[back];   
 
 
 for(size_t x=0;x<objects_len;x++){
@@ -175,20 +221,21 @@ atomic_store(&triangle_tracker,0);
 
 }
 
+// present: the buffer just drawn becomes the one get_frame_buffer() hands out.
+// A pointer swap, so nothing is copied and the frame that was on screen a moment
+// ago becomes the next back buffer.
+back^=1;
 return true;
 }
 
-void clear_frame_buffer(bool keep_frame){
-    if(!keep_frame)free(frame);
-    if(screen_hieght!=0 && screen_width!=0)create_frame_buffer(screen_width,screen_hieght);
-    else frame=NULL;
-}
+
 
 void renderer_resize(uint32_t win_w,uint32_t win_h){
     screen_width=win_w;
     screen_hieght=win_h;
     setup_camera();
-    clear_frame_buffer(false);
+    // a new size means new buffers; this is the only other place they are made
+    frame_buffers_alloc(win_w,win_h);
 }
 
 // Slide the whole camera box by (dx,dy,dz). Both ends of every axis move

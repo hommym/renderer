@@ -140,7 +140,6 @@ if(win==NULL){
         if(is_proc_running && needs_redraw){
             if(pending_yaw!=0.0 || pending_pitch!=0.0)
                 rotate_camera(pending_yaw,pending_pitch);
-            clear_frame_buffer(false);
             render();
             update_win(get_frame_buffer());
         }
@@ -185,7 +184,7 @@ uint32_t b=((argb&0xFFu)*a+bb*ia+127u)/255u;
 return 0xFF000000u|(r<<16)|(g<<8)|b;
 }
 
-void update_win(PixelCord* frame_buffer){
+void update_win(const PixelCord* frame_buffer){
 if(win==NULL){
     printf("No window to update\n");
     return;

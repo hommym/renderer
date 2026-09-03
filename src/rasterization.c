@@ -158,7 +158,7 @@ cull_forced=on;
 }
 
 static void rasterizer(Vectex source_triangle[3],Object* obj){
-PixelCord (*frame_buffer)[screen_width]= (PixelCord (*)[screen_width])get_frame_buffer(); 
+PixelCord (*frame_buffer)[screen_width]= (PixelCord (*)[screen_width])renderer_back_buffer(); 
 size_t w=(*obj).texture_width;
 
 uint32_t (*texture)[w]=(uint32_t (*)[w]) (*obj).texture;

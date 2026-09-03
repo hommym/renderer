@@ -10,7 +10,8 @@
 typedef struct PixelCord PixelCord;
 
 extern SDL_Window* win;
-void update_win(PixelCord* frame_buffer);
+// Reads the renderer's finished frame. Borrowed, never freed here.
+void update_win(const PixelCord* frame_buffer);
 void create_window();
 void set_up_event_handler();
 void get_window_size(int* w,int* h);

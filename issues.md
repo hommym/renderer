@@ -8,7 +8,7 @@ Open problems in the renderer. Each entry: what breaks, why it breaks, fix direc
 
 **What breaks.** The same scene renders differently every run. Some pixels end up holding a combination of values that no triangle ever produced.
 
-**Why.** `rasterization.c:289-294` (span fill) and `rasterization.c:303-308` (edge pixel) both do an unsynchronised read-modify-write:
+**Why.** `rasterization.c:352-358` (span fill) and `rasterization.c:367-372` (edge pixel) both do an unsynchronised read-modify-write:
 
 ```c
 PixelCord existing = frame_buffer[y][x];              // 1. read
@@ -33,7 +33,7 @@ The cube hides this because 12 triangles barely contend for the same pixel; a re
 
 **What breaks.** Undefined behaviour on every worker exit.
 
-**Why.** `rasterization.c:321` declares `void* rasterization_worker(void* args)` and the function body ends after the `while` loop with no `return`. Reaching the closing brace of a non-`void` function and having the caller use the value is UB. `pthread_join` is passed `NULL` for the result today, so nothing reads it and it does not misbehave in practice.
+**Why.** `rasterization.c:384` declares `void* rasterization_worker(void* args)` and the function body ends after the `while` loop with no `return`. Reaching the closing brace of a non-`void` function and having the caller use the value is UB. `pthread_join` is passed `NULL` for the result today, so nothing reads it and it does not misbehave in practice.
 
 **Fix path.** `return NULL;` at the end. `args` is also unused (`-Wunused-parameter`) — cast it to void or use it, since the worker index is currently passed and discarded.
 
@@ -114,26 +114,9 @@ So it is real but currently invisible: half the pixels of the forest land on a *
 
 ---
 
-## 7. `clear_frame_buffer(true)` leaks the old buffer
+## 7. The rasterizer indexes the texture with no bounds check
 
-**What breaks.** Calling it with `keep_frame == true` leaks the previous frame buffer — one full `screen_width * screen_height * sizeof(PixelCord)` allocation per call (48 MB at 1500x1000).
-
-**Why.** `renderer.c:158`:
-
-```c
-if(!keep_frame) free(frame);
-if(screen_hieght!=0 && screen_width!=0) create_frame_buffer(screen_width,screen_hieght);
-```
-
-`create_frame_buffer` unconditionally overwrites `frame` with a fresh `calloc`, so skipping the `free` does not keep the old buffer reachable — it strands it. No caller passes `true` today (all three call sites pass `false`), but `ARCHITECTURE.md` documents the flag as meaning the old buffer "still exists and can be referenced".
-
-**Fix path.** Decide what the flag means. If it is "reuse the existing allocation", return early instead of reallocating. If it is "hand ownership of the old buffer to the caller", it has to return the pointer. `create_frame_buffer` also never checks its `calloc` result; `render()` guards on `frame == NULL` but `update_win()` does not.
-
----
-
-## 8. The rasterizer indexes the texture with no bounds check
-
-**What breaks.** `rasterization.c:290-291` and `:305-306` compute
+**What breaks.** `rasterization.c:353-354` and `:368-369` compute
 
 ```c
 size_t f_row=(size_t)(obj->texture_height*fill_pixel.v);
@@ -151,11 +134,11 @@ A hand-built `Object` (the cube in `main.c`) is not covered by any of that; its 
 
 ---
 
-## 9. `Vectex.colour` is no longer drawn
+## 8. `Vectex.colour` is no longer drawn
 
 **What breaks.** A mesh whose colour lives per vertex and not in an image — PLY `red/green/blue`, glTF `COLOR_0`, the non-standard OBJ `v x y z r g b` — renders as one flat colour.
 
-**Why.** The rasterizer overwrites every pixel's colour with a texture sample (`rasterization.c:293`, `:307`) rather than using the interpolated `current.colour`. The loaders still fill `Vectex.colour`, and the flat fallback texture is built from it (PLY averages every vertex colour into its 1x1 texture), so the model gets its overall tone but none of its variation.
+**Why.** The rasterizer overwrites every pixel's colour with a texture sample (`rasterization.c:356`, `:370`) rather than using the interpolated `current.colour`. The loaders still fill `Vectex.colour`, and the flat fallback texture is built from it (PLY averages every vertex colour into its 1x1 texture), so the model gets its overall tone but none of its variation.
 
 There is no way to fix this in the loader: a texture lookup cannot reproduce per-vertex colour, because interpolating `u,v` across a triangle sweeps a rectangle of unrelated texels rather than blending three corner colours.
 
@@ -171,7 +154,7 @@ or give `Object` an explicit flag rather than inferring from the 1x1 fallback.
 
 ---
 
-## 10. Three of fourteen models are refused by the `extensionsRequired` gate
+## 9. Three of fourteen models are refused by the `extensionsRequired` gate
 
 **What breaks.** `citlali.glb`, `citlali/source/.../scene.gltf` and `a_salsa_dance.glb` load as `MESH_ERR_UNSUPPORTED`.
 
@@ -183,7 +166,7 @@ The blanket refusal is right in principle — a required extension may change th
 
 ---
 
-## 11. Texture alpha is discarded
+## 10. Texture alpha is discarded
 
 **What breaks.** A texture's transparent regions paint as opaque colour. Anything authored as an alpha cutout — foliage, fences, grates, hair — renders as a solid card instead of a cut-out shape.
 
@@ -195,7 +178,7 @@ Measured over the current model set, `dae_-_eco_house.glb` is the case that has 
 
 ---
 
-## 12. Every material in the current model set is marked `doubleSided`
+## 11. Every material in the current model set is marked `doubleSided`
 
 **What breaks.** Back-face culling never engages on any model that is loaded
 today, so none of them get the roughly one third off frame time it offers.
