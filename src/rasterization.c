@@ -318,6 +318,17 @@ edge_cursor[edge_i]=cursor;
 // left-to-right sort by px so the pair walk below defines contiguous spans.
 sort_pixelcords_by_px(scanline_pixels, scanline_pixel_count);
 
+// Every pixel the pair walk touches is on THIS row -- the gather above only
+// collected pixels whose py equals row_y -- so one lock covers all of them.
+// Taken here rather than around each write: the gather and the sort touch only
+// local memory, and acquiring per pixel would be hundreds of thousands of
+// atomics a frame for a section that is already exclusive.
+//
+// A row outside the screen can never be stored (every write site tests
+// is_visible first), so there is nothing to protect and nothing to serialise on.
+bool row_locked = row_y>=0.0 && row_y<(double)screen_hieght;
+if(row_locked)frame_row_lock((size_t)row_y);
+
 // walk consecutive pairs (current,next). the gap between them is the row's
 // interior on this side of the triangle — fill it with interpolated pixels.
 for(uint64_t pair_i=0;pair_i<scanline_pixel_count;pair_i++){
@@ -371,6 +382,8 @@ current.colour=texture[c_row][c_col];
 // z-buffer test again for the edge pixel itself.
 if(!(existing.in_use && existing.z<current.z))frame_buffer[(uint64_t)current.py][(uint64_t)current.px]=current;
 }
+
+if(row_locked)frame_row_unlock((size_t)row_y);
 
 }
 

@@ -4,28 +4,41 @@ Open problems in the renderer. Each entry: what breaks, why it breaks, fix direc
 
 ---
 
-## 1. The frame buffer is raced by the rasterization threads
+## 1. Shared triangle edges break depth ties by arrival order
 
-**What breaks.** The same scene renders differently every run. Some pixels end up holding a combination of values that no triangle ever produced.
+**What breaks.** The same scene renders slightly differently every run. Roughly a
+thousand pixels out of 400,000 change colour between two renders of an identical
+frame.
 
-**Why.** `rasterization.c:352-358` (span fill) and `rasterization.c:367-372` (edge pixel) both do an unsynchronised read-modify-write:
+**Why.** Not a data race any more -- the row locks fixed that, and it is worth
+being precise about what is left:
+
+| | before locks | after locks |
+| --- | --- | --- |
+| torn 40-byte writes | 210 over 6 frames | **0** |
+| pixels where `z` differs run to run | many | **0** |
+| pixels where `u`/`v` differ run to run | many | ~1,000 |
+
+Depth is now identical on every pixel of every run, so the correct nearest
+fragment always wins. What varies is *which of two fragments at exactly the same
+depth* wins, and the depth test breaks that tie by whoever writes last:
 
 ```c
-PixelCord existing = frame_buffer[y][x];              // 1. read
-if(!(existing.in_use && existing.z < fill_pixel.z))   // 2. decide
-    frame_buffer[y][x] = fill_pixel;                  // 3. write
+if(!(existing.in_use && existing.z < fill_pixel.z))   // strict <, so a tie overwrites
 ```
 
-Work is partitioned **by triangle**, so two threads routinely land on the same pixel. Two failures follow:
+Measured: 21,685 exact ties on `dae_-_eco_house.glb` and 7,050 on
+`woman_seated_v12.glb` -- **all of them in the edge-pixel path, none in the span
+fill**. That is the signature of adjacent triangles both rasterizing the edge
+they share. Both land on the same pixel at the same depth carrying different
+interpolated `u`/`v`, and whichever thread gets there second wins.
 
-- *Lost update.* Both threads read the same `existing`, both conclude they are in front, and the second write clobbers the first. The depth test was answered correctly about a state that no longer existed, so the farther fragment can win.
-- *Torn write.* `sizeof(PixelCord) == 32` — four 64-bit words, not one atomic store. Two threads writing the same pixel interleave inside the copy.
-
-Measured on 240 overlapping triangles with 8 workers: identical input, 8 runs, 8 different frame hashes at a constant 922,437 painted pixels. Between 78 and 943 pixels per run carried one triangle's colour beside another triangle's depth — a pairing that cannot exist in the input.
-
-The cube hides this because 12 triangles barely contend for the same pixel; a real mesh contends at every overlap and silhouette.
-
-**Fix path.** Partition so no two threads can address the same pixel, rather than locking. Interleave by screen row (thread `i` owns rows where `row % nthreads == i`) or by tile: every thread still walks every triangle, but only writes rows it owns, so the depth test stays a plain read-modify-write on private memory. Costs redundant clip/project per thread; the fill work — the expensive part — still divides. A mutex per pixel is impractical and one global lock removes the point of threading.
+**Fix path.** Give the tie a stable answer instead of an order-dependent one:
+on exact equality keep whichever fragment sorts first by some key the threads
+agree on regardless of when they arrive -- the packed `u`/`v`, or a triangle
+index if `Object` ever carries one. One comparison at each of the two write
+sites. It cannot be fixed by locking harder; both writers are equally correct
+and the renderer simply has not said which it prefers.
 
 ---
 

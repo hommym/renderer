@@ -41,6 +41,36 @@ static size_t objects_len=0;
 // that is a 60MB release and a 60MB zeroed allocation per frame, and it handed
 // out a pointer that the next clear silently invalidated -- anything that held
 // on to the result of get_frame_buffer() across a frame was reading freed memory.
+// ---- frame buffer row locks ----------------------------------------------
+//
+// Work is handed out by triangle, so two threads routinely land on the same
+// pixel, and the depth test there is a read-modify-write:
+//
+//     existing = frame_buffer[y][x];   if(closer) frame_buffer[y][x] = pixel;
+//
+// Unsynchronised that loses updates -- both threads read the same `existing`,
+// both conclude they are in front, and the second write clobbers the first -- and
+// it tears, because a PixelCord is 40 bytes and no store that wide is atomic.
+//
+// A lock per pixel is impossible (1.5M of them) and one lock for the whole
+// buffer would remove the point of threading. A lock per ROW BAND is the middle:
+// the scanline pass writes one row at a time, so a whole triangle-row is a
+// single acquire, and two threads only wait on each other when their rows
+// collide modulo FRAME_LOCK_BANDS.
+//
+// Padded to a cache line each. Packed together, locking two different bands
+// would still bounce the same line between cores and reintroduce most of the
+// contention the banding exists to avoid.
+#define FRAME_LOCK_BANDS 256u      // power of two, so the index is a mask
+#define FRAME_LOCK_LINE  64u
+
+typedef struct RowLock {
+    atomic_flag held;
+    char pad[FRAME_LOCK_LINE-sizeof(atomic_flag)];
+} RowLock;
+
+static RowLock row_locks[FRAME_LOCK_BANDS];
+
 static PixelCord* buffers[2]={NULL,NULL};
 static size_t buffer_cells=0;
 static int back=0;                 // buffers[back] is the one being drawn into
@@ -121,6 +151,23 @@ return camera;
 
 
 
+// A spinlock, not a mutex: the critical section is one row of one triangle, so
+// the wait is shorter than the round trip into the kernel that a sleeping lock
+// would pay. There is never more than one thread per core here, so nobody spins
+// waiting for a holder that has been descheduled.
+void frame_row_lock(size_t row){
+RowLock* l=&row_locks[row&(FRAME_LOCK_BANDS-1u)];
+while(atomic_flag_test_and_set_explicit(&l->held,memory_order_acquire)){
+#if defined(__x86_64__)||defined(__i386__)
+    __builtin_ia32_pause();   // stop hammering the cache line while waiting
+#endif
+}
+}
+
+void frame_row_unlock(size_t row){
+atomic_flag_clear_explicit(&row_locks[row&(FRAME_LOCK_BANDS-1u)].held,memory_order_release);
+}
+
 const PixelCord* get_frame_buffer(){
     // the front buffer: the last frame render() finished and swapped in
     return buffers[back^1];
@@ -142,6 +189,7 @@ objects_len=objs==NULL?0:len;   // a NULL array has no elements, whatever len sa
 
 void render_init(Object* objs,uint64_t len,uint32_t win_w,uint32_t win_h){
 // needs to be called once to initialise the renderer
+for(size_t i=0;i<FRAME_LOCK_BANDS;i++)atomic_flag_clear(&row_locks[i].held);
 num_core=get_number_of_cores(); // loading the number of core on system to know number of threads to spawn
 num_core=num_core<0?1:num_core-1;
 frame_buffers_alloc(win_w,win_h);
@@ -170,7 +218,9 @@ PixelCord (*frame_buffer)[screen_width]= (PixelCord (*)[screen_width])buffers[ba
 for(size_t x=0;x<objects_len;x++){
 Object obj=objects[x];
 
-// no connectors -> paint each visible vertex as one pixel
+// no connectors -> paint each visible vertex as one pixel. no row lock needed:
+// this path runs on the calling thread and finishes before any worker is
+// spawned, so nothing else is touching the buffer while it writes.
 if(obj.len_of_connectors==0){
     size_t w=obj.texture_width;
     uint32_t (*texture)[w]=(uint32_t (*)[w]) (obj).texture;

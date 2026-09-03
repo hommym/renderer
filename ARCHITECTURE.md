@@ -77,6 +77,45 @@ Only the triangle path is threaded. The point-cloud path runs on the calling thr
 
 ---
 
+### Frame buffer locking
+
+Work is handed out **by triangle**, so two threads routinely reach the same
+pixel, and the depth test there is a read-modify-write:
+
+```c
+existing = frame_buffer[y][x];   if(closer) frame_buffer[y][x] = pixel;
+```
+
+Unsynchronised that loses updates -- both threads read the same `existing`, both
+conclude they are in front, and the second write clobbers the first -- and it
+tears, because a `PixelCord` is 40 bytes and no store that wide is atomic.
+
+A lock per pixel is impossible (1.5M of them) and one lock for the buffer would
+remove the point of threading. The unit used is a **row band**: the scanline pass
+writes one row at a time, so a whole triangle-row is a single acquire, and two
+threads only wait on each other when their rows collide modulo the band count.
+
+- 256 bands, indexed `row & 255`, each padded to its own cache line. Packed
+  together, locking two different bands would still bounce one line between cores
+  and reintroduce most of the contention the banding exists to avoid.
+- Spinlocks, not mutexes: the critical section is one row of one triangle, so
+  waiting is cheaper than a round trip into the kernel, and there is never more
+  than one thread per core to be descheduled while holding one.
+- Taken after the row's gather and sort, which touch only thread-local memory.
+- A row outside the screen is never locked; nothing can be stored there.
+
+Measured: torn writes go from 210 over six frames to **0**, and depth becomes
+identical on every pixel of every run. The cost is 11-21% of frame time
+(`dae_-_eco_house` 54.6 -> 66.3 ms, `woman_seated_v12` 28.2 -> 31.4 ms,
+`corrupted_archangel` 361.9 -> 414.1 ms), which is the price of roughly half a
+million uncontended atomics per frame.
+
+The point-cloud path in `render()` takes no lock: it runs on the calling thread
+and finishes before any worker is spawned.
+
+What locking does *not* fix is which of two fragments at exactly the same depth
+wins -- that is a tie the depth test resolves by arrival order (`issues.md` 1).
+
 ## 5. Core types
 
 **`Vectex`** — world-space position (`x`,`y`,`z`), a texture coordinate (`u`,`v`), and a 32-bit colour. The input format.

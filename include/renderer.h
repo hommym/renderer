@@ -145,6 +145,18 @@ Camera get_camera_pos();
 // memory that had already been released.
 const PixelCord* get_frame_buffer();
 
+// Take the lock covering `row` of the back buffer before touching any of that
+// row's pixels, and release it after. Work is partitioned by triangle, so two
+// threads reach the same pixel routinely, and the depth test there is a
+// read-modify-write that has to be indivisible -- otherwise the farther fragment
+// can win, and a 40-byte PixelCord can be half written by each of two threads.
+//
+// One acquire per triangle-row, not per pixel: the scanline pass already works a
+// row at a time. Rows share a lock when they collide modulo the band count, so a
+// collision costs a short wait rather than a wrong pixel.
+void frame_row_lock(size_t row);
+void frame_row_unlock(size_t row);
+
 // The buffer being drawn into, for the rasterization workers only. Not part of
 // the interface a caller should reach for: it is a half-finished frame.
 PixelCord* renderer_back_buffer();

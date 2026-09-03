@@ -10,7 +10,7 @@
 // roughly 1 unit tall -- and this camera is a fixed pinhole at the world origin,
 // so without a fit pass a model is either a speck or swallows the screen.
 // note the spelling: the file is appartement.glb, not appartment.glb
-#define MODEL_PATH "/home/arthur-herberth/Documents/models/dark_elf_spellblade_in_obsidian_armor.glb"
+#define MODEL_PATH "/home/arthur-herberth/Documents/models/appartement/source/appartement.glb"
 
 #define MODEL_EXTENT   420.0
 #define MODEL_CENTRE_X 180.0     // right of centre; the cube sits on the left
@@ -97,7 +97,7 @@ int cores=get_number_of_cores();
 printf("cores: %d\n",cores);
 render_init(scene,scene_len,(uint32_t)w,(uint32_t)h);
 render();
-update_win(get_frame_buffer());
+update_win((PixelCord*)get_frame_buffer());
 set_up_event_handler();
 free(scene);
 // releases every object's arrays and every distinct texture. never mesh_free an
