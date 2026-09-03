@@ -1,32 +1,119 @@
 #include "rasterization.h"
 #include "renderer.h"
 #include "projection.h"
-#include "wireframe.h"
 #include "utils.h"
 #include "interpolation.h"
 #include "transform.h"
+#include <string.h>
 
+// v3: binned, lock-free, deterministic edge-walk rasterizer.
+//
+// Two passes over a chunk of triangles:
+//
+//   A. SETUP (parallel by triangle). Each thread takes a contiguous, statically
+//      assigned range of the chunk, transforms/culls/clips/projects it, and
+//      writes the survivors into its OWN slice of a shared setup array. It then
+//      records each survivor's index in its own bin for every row BAND the
+//      triangle touches. Nothing is shared, so nothing is locked.
+//
+//   B. FILL (parallel by band). A band is a horizontal strip of the frame
+//      buffer, and a band is claimed by exactly ONE thread, so a pixel has
+//      exactly one writer and the lock disappears entirely.
+//
+// Determinism falls out of this for free. Thread t's setup slice sits entirely
+// below thread t+1's, so walking a band's bins thread-by-thread visits
+// triangles in increasing source order. Two fragments at exactly the same depth
+// therefore resolve the same way on every run, which is what issue 1 was about.
 
-// How far in front of the camera the near plane sits, in world units. The
-// perspective divide is only meaningful in front of the camera: at depth 0 it
-// is undefined, and behind the camera it flips the sign of the offset, so
-// geometry projects inverted instead of disappearing.
 #define NEAR_PLANE_MARGIN 1.0
-
-// Which sign of the facing test means "away from the eye". Determined by the
-// winding the loaders end up producing, which is glTF/OBJ counter-clockwise put
-// through mesh_fit_to_view's y mirror -- so it is measured, not assumed. See the
-// commit that added this.
-// Measured, not assumed: with sign -1 the culled render differs from the
-// unculled one by 0.02% of pixels on the archangel and 0.10% on the tree, which
-// is the depth-test noise floor. With +1 it differs by 9.88% and 5.90% -- the
-// inside of the model, drawn instead of the outside.
 #define BACKFACE_SIGN (-1.0)
 
-// Set by set_backface_cull_forced(). Read-only during a frame.
+// A chunk is sized so its setup array stays in cache rather than so that it
+// holds a whole model: 2M triangles' worth of setup would be hundreds of MB.
+#define CHUNK_TRIS   32768u
+#define BAND_ROWS    16u
+
+// Below this alpha a texel is treated as a hole rather than a colour: not
+// painted, and not depth-written. True alpha blending would need the triangles
+// sorted back to front, which a z-buffer-only pipeline has no machinery for.
+#define ALPHA_CUTOFF 128u
+
 static bool cull_forced=false;
 
-// Walk t of the way from a to b, in world space and in colour.
+typedef struct CamSnap {
+    double z,z_end,focal_l;
+    double x_centre,y_centre;
+    double half_w,half_h;
+    double eye[3];
+} CamSnap;
+static CamSnap cam;
+
+void rasterization_frame_begin(void){
+    Camera c=get_camera_pos();
+    cam.z=c.z; cam.z_end=c.z_end; cam.focal_l=c.focal_l;
+    cam.x_centre=c.x+(c.x_end-c.x)/2.0;
+    cam.y_centre=c.y+(c.y_end-c.y)/2.0;
+    cam.half_w=(double)screen_width/2.0;
+    cam.half_h=(double)screen_hieght/2.0;
+    const double* e=view_eye();
+    cam.eye[0]=e[0]; cam.eye[1]=e[1]; cam.eye[2]=e[2];
+}
+
+// ---- setup records and bins ------------------------------------------------
+
+typedef struct SetupTri {
+    double x[3],y[3];        // screen space, floored, in y order
+    double uw[3],vw[3],iw[3];// u/w, v/w and 1/w: the three things linear in screen space
+    int32_t row0,row1;       // rows this triangle covers, clamped to the screen
+} SetupTri;
+
+typedef struct Bin { uint32_t* idx; uint32_t n,cap; } Bin;
+
+static SetupTri* setup=NULL;
+static size_t    setup_cap=0;
+static uint32_t* setup_n=NULL;      // per thread: how many records it wrote
+static Bin*      bins=NULL;         // [thread*nbands + band]
+static uint32_t  nbands=0;
+static uint32_t  nthreads=0;
+
+static bool bin_push(Bin* b,uint32_t v){
+    if(b->n==b->cap){
+        uint32_t cap=b->cap?b->cap*2u:64u;
+        uint32_t* p=realloc(b->idx,(size_t)cap*sizeof *p);
+        if(!p)return false;          // drop the triangle rather than crash
+        b->idx=p; b->cap=cap;
+    }
+    b->idx[b->n++]=v;
+    return true;
+}
+
+// Sized once per window/thread-count and reused for the life of the frame loop.
+bool rasterization_pool_init(uint32_t threads){
+    uint32_t nb=(screen_hieght+BAND_ROWS-1u)/BAND_ROWS;
+    if(nb==0)nb=1;
+    if(threads==0)threads=1;
+    if(bins&&nb==nbands&&threads==nthreads&&setup)return true;
+
+    rasterization_pool_release();
+    nbands=nb; nthreads=threads;
+    // two output triangles per source triangle is the near clip's worst case
+    setup_cap=(size_t)CHUNK_TRIS*2u;
+    setup=malloc(setup_cap*sizeof *setup);
+    setup_n=calloc(threads,sizeof *setup_n);
+    bins=calloc((size_t)threads*nbands,sizeof *bins);
+    if(!setup||!setup_n||!bins){ rasterization_pool_release(); return false; }
+    return true;
+}
+
+void rasterization_pool_release(void){
+    if(bins)for(size_t i=0;i<(size_t)nthreads*nbands;i++)free(bins[i].idx);
+    free(bins); free(setup); free(setup_n);
+    bins=NULL; setup=NULL; setup_n=NULL;
+    setup_cap=0; nbands=0; nthreads=0;
+}
+
+// ---- geometry --------------------------------------------------------------
+
 static Vectex lerp_vectex(Vectex a,Vectex b,double t){
 if(t<0.0)t=0.0;
 if(t>1.0)t=1.0;
@@ -36,376 +123,273 @@ out.y=a.y+(b.y-a.y)*t;
 out.z=a.z+(b.z-a.z)*t;
 out.u=a.u+(b.u-a.u)*t;
 out.v=a.v+(b.v-a.v)*t;
-
-// reuse the per-channel lerp rather than blending the packed word, which
-// would carry bits between channels. 1000 steps is far finer than 8 bits.
 out.colour=interpolate_colour(a.colour,b.colour,1000,(size_t)(t*1000.0+0.5));
 return out;
 }
 
-// Clip a triangle against the near plane. Writes up to 2(max) replacement triangles
-// into out argument of the function and returns how many triangles were written: 0 when the triangle is wholly behind the
-// plane, 1 when it is wholly in front (unchanged) or only one corner survives,
-// 2 when two corners survive and the remainder is a quad.
 static uint8_t clip_triangle_near(Vectex tri[3],Vectex out[2][3]){
-double plane_z=get_camera_pos().z+NEAR_PLANE_MARGIN;
-
+double plane_z=cam.z+NEAR_PLANE_MARGIN;
 Vectex inside[3],outside[3];
-uint8_t inside_n=0,outside_n=0;
-//checking which vertex of the triangle is inside the near plane or outside it
+uint8_t in_n=0,out_n=0;
 for(uint8_t i=0;i<3;i++){
-    if(tri[i].z>=plane_z)inside[inside_n++]=tri[i];
-    else outside[outside_n++]=tri[i];
+    if(tri[i].z>=plane_z)inside[in_n++]=tri[i];
+    else outside[out_n++]=tri[i];
 }
-
-if(inside_n==0)return 0;
-if(inside_n==3){
-    out[0][0]=tri[0];
-    out[0][1]=tri[1];
-    out[0][2]=tri[2];
-    return 1;
-}
-
-// where along in->out the edge crosses the plane. the two points sit on
-// opposite sides, so the denominator is never zero and t lands in [0,1].
-#define CROSS_T(in_v,out_v) ((plane_z-(in_v).z)/((out_v).z-(in_v).z))
-
-if(inside_n==1){
-    // one corner survives: what is left is a smaller triangle.
+if(in_n==0)return 0;
+if(in_n==3){ out[0][0]=tri[0];out[0][1]=tri[1];out[0][2]=tri[2]; return 1; }
+#define CROSS_T(a,b) ((plane_z-(a).z)/((b).z-(a).z))
+if(in_n==1){
     out[0][0]=inside[0];
     out[0][1]=lerp_vectex(inside[0],outside[0],CROSS_T(inside[0],outside[0]));
     out[0][2]=lerp_vectex(inside[0],outside[1],CROSS_T(inside[0],outside[1]));
     return 1;
 }
-
-// two corners survive: what is left is the quad (inside0, inside1, cross1,
-// cross0). split it on the inside1..cross0 diagonal.
-Vectex cross0=lerp_vectex(inside[0],outside[0],CROSS_T(inside[0],outside[0]));
-Vectex cross1=lerp_vectex(inside[1],outside[0],CROSS_T(inside[1],outside[0]));
+Vectex c0=lerp_vectex(inside[0],outside[0],CROSS_T(inside[0],outside[0]));
+Vectex c1=lerp_vectex(inside[1],outside[0],CROSS_T(inside[1],outside[0]));
 #undef CROSS_T
-
-out[0][0]=inside[0];
-out[0][1]=inside[1];
-out[0][2]=cross0;
-
-out[1][0]=inside[1];
-out[1][1]=cross1;
-out[1][2]=cross0;
+out[0][0]=inside[0];out[0][1]=inside[1];out[0][2]=c0;
+out[1][0]=inside[1];out[1][1]=c1;out[1][2]=c0;
 return 2;
 }
 
 bool is_vectex_visible(Vectex point,PixelCord* pxcord_p){
-bool is_z_in_view=point.z<=get_camera_pos().z_end;
-if(!is_z_in_view){
-    // write the flag even on the early out. callers read it back off the
-    // PixelCord afterwards, and leaving it untouched hands them whatever
-    // happened to be on the stack.
-    (*pxcord_p).is_visible=false;
-    return false;
-}
-
-double y_center=get_camera_pos().y+(get_camera_pos().y_end-get_camera_pos().y)/2;
-double y_offset=(screen_hieght/2)*(point.z-get_camera_pos().z)/get_camera_pos().focal_l;
-
-
-double x_center=get_camera_pos().x+(get_camera_pos().x_end-get_camera_pos().x)/2;    
-double x_offset=(screen_width/2)*(point.z-get_camera_pos().z)/get_camera_pos().focal_l;
-
-
-bool is_x_in_view=point.x>=(x_center-x_offset) && point.x<(x_center+x_offset);
-bool is_y_in_view=point.y>=(y_center-y_offset) && point.y<(y_center+y_offset);
-
-(*pxcord_p).is_visible=is_x_in_view && is_y_in_view;
-
-
+Camera c=get_camera_pos();
+if(point.z>c.z_end){ (*pxcord_p).is_visible=false; return false; }
+double y_center=c.y+(c.y_end-c.y)/2;
+double y_offset=(screen_hieght/2)*(point.z-c.z)/c.focal_l;
+double x_center=c.x+(c.x_end-c.x)/2;
+double x_offset=(screen_width/2)*(point.z-c.z)/c.focal_l;
+(*pxcord_p).is_visible = point.x>=(x_center-x_offset) && point.x<(x_center+x_offset)
+                      && point.y>=(y_center-y_offset) && point.y<(y_center+y_offset);
 return (*pxcord_p).is_visible;
 }
 
-
-
-// Which way a triangle faces, as seen from the eye.
-//
-// N = (b-a) x (c-a) is the triangle's plane normal, and the sign of
-// N . (a - eye) says which side of that plane the eye is on -- which is the same
-// question as which of the two faces it can see. No projection needed, and no
-// division.
-//
-// Done BEFORE the near-plane clip on purpose. Clipping only cuts a triangle up
-// within its own plane, so every piece it produces has the same normal and the
-// same facing as the whole. One test per source triangle covers all of them, and
-// it sidesteps the fact that clip_triangle_near does not preserve winding.
-//
-// A degenerate triangle gives N = 0 and a dot product of 0, so it falls through
-// and is drawn. It covers no area anyway, and treating "no normal" as "facing
-// away" would quietly drop slivers that are only degenerate to rounding.
 static bool is_back_facing(const Vectex t[3]){
-const double* eye=view_eye();
-
 double ax=t[1].x-t[0].x, ay=t[1].y-t[0].y, az=t[1].z-t[0].z;
 double bx=t[2].x-t[0].x, by=t[2].y-t[0].y, bz=t[2].z-t[0].z;
-
-double nx=ay*bz-az*by;
-double ny=az*bx-ax*bz;
-double nz=ax*by-ay*bx;
-
-double ex=t[0].x-eye[0], ey=t[0].y-eye[1], ez=t[0].z-eye[2];
-
+double nx=ay*bz-az*by, ny=az*bx-ax*bz, nz=ax*by-ay*bx;
+double ex=t[0].x-cam.eye[0], ey=t[0].y-cam.eye[1], ez=t[0].z-cam.eye[2];
 return (nx*ex+ny*ey+nz*ez)*BACKFACE_SIGN > 0.0;
 }
 
-void set_backface_cull_forced(bool on){
-cull_forced=on;
+void set_backface_cull_forced(bool on){ cull_forced=on; }
+
+// ---- pass A: setup ---------------------------------------------------------
+
+// Builds one SetupTri from a clipped, front-facing triangle. Returns false when
+// nothing of it can land on screen.
+static bool setup_one(const Vectex tri[3],SetupTri* s){
+    double x[3],y[3],uw[3],vw[3],iw[3];
+    for(int k=0;k<3;k++){
+        double w=tri[k].z-cam.z;
+        if(w<NEAR_PLANE_MARGIN)w=NEAR_PLANE_MARGIN;   // the near clip guarantees this
+        double r=1.0/w;
+        // identical arithmetic to perspective_projection(), with 1/w in hand
+        x[k]=floor(cam.half_w+(tri[k].x-cam.x_centre)*cam.focal_l*r);
+        y[k]=floor(cam.half_h+(tri[k].y-cam.y_centre)*cam.focal_l*r);
+        uw[k]=tri[k].u*r; vw[k]=tri[k].v*r; iw[k]=r;
+    }
+
+    // screen-space bounding box reject. this is what replaces the old
+    // "is any vertex inside the camera box" test, which threw away every
+    // triangle bigger than the screen -- all three corners are outside one.
+    double bx0=x[0],bx1=x[0],by0=y[0],by1=y[0];
+    for(int k=1;k<3;k++){
+        if(x[k]<bx0)bx0=x[k]; else if(x[k]>bx1)bx1=x[k];
+        if(y[k]<by0)by0=y[k]; else if(y[k]>by1)by1=y[k];
+    }
+    if(bx1<0.0||by1<0.0||bx0>=(double)screen_width||by0>=(double)screen_hieght)return false;
+    // a whole triangle behind the far plane contributes nothing
+    if(tri[0].z>cam.z_end&&tri[1].z>cam.z_end&&tri[2].z>cam.z_end)return false;
+
+    int i0=0,i1=1,i2=2;
+    if(y[i0]>y[i1]){int t=i0;i0=i1;i1=t;}
+    if(y[i1]>y[i2]){int t=i1;i1=i2;i2=t;}
+    if(y[i0]>y[i1]){int t=i0;i0=i1;i1=t;}
+    const int ord[3]={i0,i1,i2};
+    for(int k=0;k<3;k++){
+        int o=ord[k];
+        s->x[k]=x[o]; s->y[k]=y[o];
+        s->uw[k]=uw[o]; s->vw[k]=vw[o]; s->iw[k]=iw[o];
+    }
+    int64_t r0=(int64_t)s->y[0], r1=(int64_t)s->y[2];
+    if(r0<0)r0=0;
+    if(r1>(int64_t)screen_hieght-1)r1=(int64_t)screen_hieght-1;
+    if(r0>r1)return false;
+    s->row0=(int32_t)r0; s->row1=(int32_t)r1;
+    return true;
 }
 
-static void rasterizer(Vectex source_triangle[3],Object* obj){
-PixelCord (*frame_buffer)[screen_width]= (PixelCord (*)[screen_width])renderer_back_buffer(); 
-size_t w=(*obj).texture_width;
+// Thread `tid` processes source triangles [lo,hi) of the object.
+static void setup_range(const Object* obj,uint64_t lo,uint64_t hi,uint32_t tid,uint64_t chunk_lo){
+    // thread t owns setup slots [2*(lo-chunk_lo), 2*(hi-chunk_lo)) and nothing else
+    size_t slot=(size_t)(lo-chunk_lo)*2u;
+    size_t written=0;
+    const uint64_t* conn=obj->connectors_sequence;
+    const Vectex*  vtx=obj->vertices;
 
-uint32_t (*texture)[w]=(uint32_t (*)[w]) (*obj).texture;
+    for(uint64_t t=lo;t<hi;t++){
+        Vectex src[3]={vtx[conn[t*3]],vtx[conn[t*3+1]],vtx[conn[t*3+2]]};
+        Vectex vw3[3]={view_apply(src[0]),view_apply(src[1]),view_apply(src[2])};
+        if((cull_forced||!obj->double_sided)&&is_back_facing(vw3))continue;
 
-// rotate into the camera's frame before anything else looks at these
-// coordinates. after this the camera's forward direction IS +z, which is the
-// situation the clip, the projection and the frustum cull were all written
-// against — none of them need to know the camera can turn. a copy, because
-// source_triangle points into the object's own vertex array.
-Vectex view_triangle[3]={view_apply(source_triangle[0]),
-                         view_apply(source_triangle[1]),
-                         view_apply(source_triangle[2])};
+        Vectex clipped[2][3];
+        uint8_t nc=clip_triangle_near(vw3,clipped);
+        for(uint8_t c=0;c<nc;c++){
+            SetupTri* s=&setup[slot+written];
+            if(!setup_one(clipped[c],s))continue;
+            uint32_t b0=(uint32_t)s->row0/BAND_ROWS;
+            uint32_t b1=(uint32_t)s->row1/BAND_ROWS;
+            if(b1>=nbands)b1=nbands-1;
+            for(uint32_t b=b0;b<=b1;b++)bin_push(&bins[(size_t)tid*nbands+b],(uint32_t)(slot+written));
+            written++;
+        }
+    }
+    setup_n[tid]=(uint32_t)written;
+}
 
-// roughly half the triangles of a closed mesh point away from the eye. they are
-// currently correct but wasted: the depth test throws every one of them away
-// after paying for a clip, three projections, three bresenham walks and a full
-// scanline fill.
-if((cull_forced||!(*obj).double_sided)&&is_back_facing(view_triangle))return;
+// ---- pass B: fill ----------------------------------------------------------
 
-// clip against the near plane before projecting. a vertex at or behind the
-// get_camera_pos() has no meaningful projection, so it has to be replaced by the point
-// where its edges cross the plane — one triangle can come back as two.
-Vectex clipped[2][3];
-uint8_t clipped_count=clip_triangle_near(view_triangle,clipped);
-for(uint8_t clip_i=0;clip_i<clipped_count;clip_i++){
-Vectex triangle[3]={clipped[clip_i][0],clipped[clip_i][1],clipped[clip_i][2]};
-double min_y=0,max_y=0;
+static void fill_tri(const SetupTri* s,const Object* obj,int64_t band_r0,int64_t band_r1){
+    PixelCord* fb=renderer_back_buffer();
+    const size_t tw=obj->texture_width, th=obj->texture_height;
+    const uint32_t* texture=obj->texture;
 
-// screen-space versions of the 3 world-space vertices above.
-PixelCord triangle_proj[3]={0};
-// one bresenham line per triangle edge: (0,1), (0,2), (1,2). populated in that order.
-PixelCord* edge_pixels[3]={NULL,NULL,NULL};
-uint64_t edge_pixel_count[3]={0,0,0};
-uint8_t edge_count=0;
+    int64_t r0=s->row0, r1=s->row1;
+    if(r0<band_r0)r0=band_r0;
+    if(r1>band_r1)r1=band_r1;
+    if(r0>r1)return;
 
+    double y0=s->y[0],y1=s->y[1],y2=s->y[2];
+    // one reciprocal per edge per triangle instead of a divide per row
+    double inv_ac=(y2!=y0)?1.0/(y2-y0):0.0;
+    double inv_ab=(y1!=y0)?1.0/(y1-y0):0.0;
+    double inv_bc=(y2!=y1)?1.0/(y2-y1):0.0;
 
-// early frustum cull: if no vertex is visible, no pixel of this triangle can
-// be. call all three unconditionally — || would short-circuit on the first
-// true and leave the other two triangle_proj slots unwritten.
-bool is_v0_visible=is_vectex_visible(triangle[0],triangle_proj+0);
-bool is_v1_visible=is_vectex_visible(triangle[1],triangle_proj+1);
-bool is_v2_visible=is_vectex_visible(triangle[2],triangle_proj+2);
-if(!(is_v0_visible || is_v1_visible || is_v2_visible))continue;
+    for(int64_t row=r0;row<=r1;row++){
+        double y=(double)row;
 
-// walk the 3 unique unordered edges of the triangle:
-//   edge_a=0 → pairs (0,1) and (0,2)
-//   edge_a=1 → pair  (1,2)
-// project each vertex once, run bresenham on each edge once.
-for(size_t edge_a=0;edge_a<2;edge_a++){
-// caches "triangle_proj[edge_a] has already been projected" so the second
-// edge_b iteration on the same edge_a doesn't reproject the same vertex.
-bool outer_projected=false;
-    for(size_t edge_b=edge_a+1;edge_b<=2;edge_b++){
-        // when edge_a==1, both endpoints (indices 1 and 2) were already
-        // projected during edge_a==0's iterations — skip projection and go
-        // straight to bresenham on the (1,2) edge.
-        Vectex v1=triangle[edge_a];
-        Vectex v2=triangle[edge_b];
-        if(edge_a!=1){
+        double t1=(y-y0)*inv_ac;
+        if(t1<0.0)t1=0.0; else if(t1>1.0)t1=1.0;
+        double xl =s->x[0] +(s->x[2] -s->x[0])*t1;
+        double uwl=s->uw[0]+(s->uw[2]-s->uw[0])*t1;
+        double vwl=s->vw[0]+(s->vw[2]-s->vw[0])*t1;
+        double iwl=s->iw[0]+(s->iw[2]-s->iw[0])*t1;
 
-         if(!outer_projected){
-            triangle_proj[edge_a]=(PixelCord){.z=v1.z,.u=v1.u,.v=v1.v,.is_visible=triangle_proj[edge_a].is_visible,.in_use=true};
-            triangle_proj[edge_a].px=perspective_projection(v1.x,v1.z,get_camera_pos().z,get_camera_pos().focal_l,get_camera_pos().x,get_camera_pos().x_end,screen_width);
-            triangle_proj[edge_a].py=perspective_projection(v1.y,v1.z,get_camera_pos().z,get_camera_pos().focal_l,get_camera_pos().y,get_camera_pos().y_end,screen_hieght);
-
-            // seed the projected bounding box from the first projected vertex.
-            min_y=triangle_proj[edge_a].py;
-            max_y=triangle_proj[edge_a].py;
-         }
-         triangle_proj[edge_b]=(PixelCord){.z=v2.z,.u=v2.u,.v=v2.v,.is_visible=triangle_proj[edge_b].is_visible,.in_use=true};
-         triangle_proj[edge_b].px=perspective_projection(v2.x,v2.z,get_camera_pos().z,get_camera_pos().focal_l,get_camera_pos().x,get_camera_pos().x_end,screen_width);
-         triangle_proj[edge_b].py=perspective_projection(v2.y,v2.z,get_camera_pos().z,get_camera_pos().focal_l,get_camera_pos().y,get_camera_pos().y_end,screen_hieght);
-
-        
-         if(min_y>triangle_proj[edge_b].py)min_y=triangle_proj[edge_b].py;
-         if(max_y<triangle_proj[edge_b].py)max_y=triangle_proj[edge_b].py;
-
+        double xr,uwr,vwr,iwr;
+        if(y<y1||inv_bc==0.0){
+            if(inv_ab==0.0){ xr=s->x[1]; uwr=s->uw[1]; vwr=s->vw[1]; iwr=s->iw[1]; }
+            else{
+                double t2=(y-y0)*inv_ab;
+                if(t2<0.0)t2=0.0; else if(t2>1.0)t2=1.0;
+                xr =s->x[0] +(s->x[1] -s->x[0])*t2;
+                uwr=s->uw[0]+(s->uw[1]-s->uw[0])*t2;
+                vwr=s->vw[0]+(s->vw[1]-s->vw[0])*t2;
+                iwr=s->iw[0]+(s->iw[1]-s->iw[0])*t2;
+            }
+        }else{
+            double t2=(y-y1)*inv_bc;
+            if(t2<0.0)t2=0.0; else if(t2>1.0)t2=1.0;
+            xr =s->x[1] +(s->x[2] -s->x[1])*t2;
+            uwr=s->uw[1]+(s->uw[2]-s->uw[1])*t2;
+            vwr=s->vw[1]+(s->vw[2]-s->vw[1])*t2;
+            iwr=s->iw[1]+(s->iw[2]-s->iw[1])*t2;
         }
 
-        // rasterize this edge. bresenham fills edge_line with one PixelCord
-        // per step along the edge, each carrying its own interpolated z and
-        // colour so the scanline fill below can sample them by px position.
-        int64_t dx=   triangle_proj[edge_a].px-triangle_proj[edge_b].px;
-        int64_t dy=   triangle_proj[edge_a].py-triangle_proj[edge_b].py;
+        if(xl>xr){
+            double t;
+            t=xl;xl=xr;xr=t; t=uwl;uwl=uwr;uwr=t;
+            t=vwl;vwl=vwr;vwr=t; t=iwl;iwl=iwr;iwr=t;
+        }
 
-        if(dx<0)dx*=-1;
-        if(dy<0)dy*=-1;
+        double span=xr-xl;
+        double duw=0.0,dvw=0.0,diw=0.0;
+        if(span>0.0){
+            double inv=1.0/span;
+            duw=(uwr-uwl)*inv; dvw=(vwr-vwl)*inv; diw=(iwr-iwl)*inv;
+        }
 
-        uint64_t edge_len=dx>=dy?(dx+1):(dy+1);
-        PixelCord* edge_line=calloc(edge_len,sizeof(PixelCord)); // pixel strip for this edge, one PixelCord per bresenham step
-        if(edge_line==NULL)continue;
-        bresenhame_line_algo(triangle_proj[edge_a],triangle_proj[edge_b],edge_line);
-        edge_pixels[edge_count]=edge_line;
-        edge_pixel_count[edge_count]=edge_len;
-        outer_projected=true;
-        edge_count++;
-    }
+        int64_t px0=(int64_t)xl, px1=(int64_t)xr;
+        double lead=0.0;
+        if(px0<0){ lead=(double)(0-px0); px0=0; }
+        if(px1>(int64_t)screen_width-1)px1=(int64_t)screen_width-1;
+        if(px0>px1)continue;
 
-}
+        double uw=uwl+duw*lead, vw=vwl+dvw*lead, iw=iwl+diw*lead;
+        PixelCord* rowp=fb+(size_t)row*(size_t)screen_width;
 
-// scanline pass: for each pixel row from min_y to max_y, gather the edge
-// pixels that landed on that row, sort them left-to-right, and fill the
-// gaps between consecutive pairs.
-uint64_t scanline_count=((uint64_t)(max_y-min_y))+1;
-uint64_t scanline_slot_cap=edge_pixel_count[0]+edge_pixel_count[1]+edge_pixel_count[2];
-// each entry is a POINTER into the edge_pixels arrays — no copies, so the
-// pointed-to PixelCords keep their original z/colour for interpolation. one
-// row at a time: the row is gathered, sorted, filled, then never revisited.
-PixelCord** scanline_pixels=scanline_slot_cap>0?calloc(scanline_slot_cap,sizeof(PixelCord*)):NULL;
+        for(int64_t x=px0;x<=px1;x++){
+            // the single divide per pixel. it buys the true depth AND
+            // perspective-correct texture coordinates at the same time.
+            double w=(iw>0.0)?1.0/iw:0.0;
+            double z=cam.z+w;
+            if(z>=cam.z&&z<=cam.z_end){
+                PixelCord* dst=rowp+x;
+                if(!(dst->in_use&&dst->z<z)){
+                    double uu=uw*w, vv=vw*w;
+                    // The renderer holds this bound itself rather than trusting
+                    // every producer of an Object to have wrapped its uv. The
+                    // cast is to a SIGNED type on purpose: a negative v cast
+                    // straight to size_t is an enormous subscript, and no clamp
+                    // afterwards can undo that.
+                    int64_t f_row=(int64_t)(vv*(double)th);
+                    int64_t f_col=(int64_t)(uu*(double)tw);
+                    if(f_row<0)f_row=0; else if(f_row>=(int64_t)th)f_row=(int64_t)th-1;
+                    if(f_col<0)f_col=0; else if(f_col>=(int64_t)tw)f_col=(int64_t)tw-1;
+                    uint32_t texel=texture[(size_t)f_row*tw+(size_t)f_col];
 
-// only walk rows that are actually on screen. removing rows from the triangle which is off screen
-int64_t first_row=0;
-int64_t last_row=(int64_t)scanline_count-1;
-if(min_y<0.0){
-    int64_t skip=(int64_t)(-min_y);
-    if(skip>first_row)first_row=skip;
-}
-if(max_y>(double)screen_hieght-1.0){
-    int64_t stop=(int64_t)((double)screen_hieght-1.0-min_y);
-    if(stop<last_row)last_row=stop;
-}
+                    // Alpha cutout. A base-colour texture uses alpha to cut a
+                    // leaf out of the quad it is drawn on -- 37.7% of the eco
+                    // house's atlas is fully transparent -- and a transparent
+                    // texel that wins the depth test punches a hole through
+                    // everything behind it. Skipping the pixel entirely is what
+                    // a cutout material wants, and it costs one branch.
+                    if((texel>>24)<ALPHA_CUTOFF){ uw+=duw; vw+=dvw; iw+=diw; continue; }
 
-// each bresenham strip is monotonic in py — y only ever moves by a fixed
-// step_y — so the rows can be walked with one cursor per edge. rescanning all
-// three strips for every row made the gather rows x pixels, which is what
-// turned a triangle near the get_camera_pos() into a multi-second stall.
-int8_t edge_dir[3]={1,1,1};
-int64_t edge_cursor[3]={0,0,0};
-for(uint8_t edge_i=0;edge_i<edge_count;edge_i++){
-    uint64_t n=edge_pixel_count[edge_i];
-    bool ascending= n<2 || edge_pixels[edge_i][n-1].py>=edge_pixels[edge_i][0].py;
-    edge_dir[edge_i]= ascending?1:-1;
-    edge_cursor[edge_i]= ascending?0:(int64_t)n-1;
-}
-
-for(int64_t row=first_row;scanline_pixels!=NULL && row<=last_row;row++){
-double row_y=min_y+(double)row;
-uint64_t scanline_pixel_count=0;
-
-// take this row's pixels off each strip, advancing the cursor past them.
-for(uint8_t edge_i=0;edge_i<edge_count;edge_i++){
-PixelCord* line=edge_pixels[edge_i];
-int64_t n=(int64_t)edge_pixel_count[edge_i];
-int64_t cursor=edge_cursor[edge_i];
-int8_t dir=edge_dir[edge_i];
-
-while(cursor>=0 && cursor<n && line[cursor].py<row_y)cursor+=dir;
-while(cursor>=0 && cursor<n && line[cursor].py==row_y){
-    scanline_pixels[scanline_pixel_count]=line+cursor;
-    scanline_pixel_count++;
-    cursor+=dir;
-}
-
-edge_cursor[edge_i]=cursor;
-}
-
-// left-to-right sort by px so the pair walk below defines contiguous spans.
-sort_pixelcords_by_px(scanline_pixels, scanline_pixel_count);
-
-// Every pixel the pair walk touches is on THIS row -- the gather above only
-// collected pixels whose py equals row_y -- so one lock covers all of them.
-// Taken here rather than around each write: the gather and the sort touch only
-// local memory, and acquiring per pixel would be hundreds of thousands of
-// atomics a frame for a section that is already exclusive.
-//
-// A row outside the screen can never be stored (every write site tests
-// is_visible first), so there is nothing to protect and nothing to serialise on.
-bool row_locked = row_y>=0.0 && row_y<(double)screen_hieght;
-if(row_locked)frame_row_lock((size_t)row_y);
-
-// walk consecutive pairs (current,next). the gap between them is the row's
-// interior on this side of the triangle — fill it with interpolated pixels.
-for(uint64_t pair_i=0;pair_i<scanline_pixel_count;pair_i++){
-PixelCord current=*(scanline_pixels[pair_i]);
-
-if((pair_i+1)!=scanline_pixel_count){
-PixelCord next=*(scanline_pixels[pair_i+1]);
-
-if((next.px-current.px)!=1){
-    size_t span=(size_t)(next.px-current.px);
-
-    // clamp the walk to the screen. the span itself stays the interpolation
-    // denominator, so the colours and depths of the pixels we do write are
-    // unchanged — we just skip the ones that could never be stored.
-    double span_start=current.px+1;
-    double span_end=next.px;
-    if(span_start<0.0)span_start=0.0;
-    if(span_end>(double)screen_width)span_end=(double)screen_width;
-
-    for(double fill_x=span_start;fill_x<span_end;fill_x++){
-        // how far along the span this pixel sits. derived from fill_x rather
-        // than counted, so clamping the start cannot shift the gradient.
-        size_t fill_i=(size_t)(fill_x-current.px);
-        PixelCord fill_pixel={.py=current.py,.px=fill_x,
-        .z=interpolate(current.z,next.z,span,fill_i),
-        .u=interpolate(current.u,next.u,span,fill_i),
-        .v=interpolate(current.v,next.v,span,fill_i),
-        .in_use=true
-        };
-        fill_pixel.is_visible=(current.py>=0&&current.py<screen_hieght) && fill_pixel.z>=get_camera_pos().z&&fill_pixel.z<=get_camera_pos().z_end;
-        if(!fill_pixel.is_visible)continue;
-        PixelCord existing=frame_buffer[(uint64_t)fill_pixel.py][(uint64_t)fill_pixel.px];
-        size_t f_row=(size_t)((*obj).texture_height*fill_pixel.v);
-        size_t f_col=(size_t)((*obj).texture_width*fill_pixel.u);
-
-        fill_pixel.colour=texture[f_row][f_col];
-        // z-buffer test: only overwrite if this pixel is closer to the get_camera_pos().
-        if(!(existing.in_use && existing.z<fill_pixel.z))frame_buffer[(uint64_t)fill_pixel.py][(uint64_t)fill_pixel.px]=fill_pixel;
+                    dst->px=(double)x; dst->py=(double)row; dst->z=z;
+                    dst->u=(float)uu; dst->v=(float)vv;
+                    dst->is_visible=true; dst->in_use=true;
+                    dst->colour=texel;
+                }
+            }
+            uw+=duw; vw+=dvw; iw+=diw;
+        }
     }
 }
 
-
-
+// One band, walked in canonical order: every thread's bin in thread order, and
+// each bin in push order. That is increasing source-triangle order, so a depth
+// tie resolves identically on every run.
+static void fill_band(const Object* obj,uint32_t band){
+    int64_t r0=(int64_t)band*BAND_ROWS;
+    int64_t r1=r0+BAND_ROWS-1;
+    if(r1>(int64_t)screen_hieght-1)r1=(int64_t)screen_hieght-1;
+    for(uint32_t t=0;t<nthreads;t++){
+        Bin* b=&bins[(size_t)t*nbands+band];
+        for(uint32_t i=0;i<b->n;i++)fill_tri(&setup[b->idx[i]],obj,r0,r1);
+    }
 }
 
-if(!current.is_visible)continue;
-PixelCord existing=frame_buffer[(uint64_t)current.py][(uint64_t)current.px];
-size_t c_row=(size_t)((*obj).texture_height*current.v);
-size_t c_col=(size_t)((*obj).texture_width*current.u);
-current.colour=texture[c_row][c_col];
-// z-buffer test again for the edge pixel itself.
-if(!(existing.in_use && existing.z<current.z))frame_buffer[(uint64_t)current.py][(uint64_t)current.px]=current;
+// ---- the frame worker ------------------------------------------------------
+
+static _Atomic uint32_t band_cursor;
+
+void rasterization_setup_pass(const Object* obj,uint64_t chunk_lo,uint64_t chunk_hi,uint32_t tid){
+    uint64_t n=chunk_hi-chunk_lo;
+    uint64_t lo=chunk_lo+n*tid/nthreads;
+    uint64_t hi=chunk_lo+n*(tid+1)/nthreads;
+    setup_range(obj,lo,hi,tid,chunk_lo);
 }
 
-if(row_locked)frame_row_unlock((size_t)row_y);
-
+void rasterization_fill_pass(const Object* obj){
+    uint32_t b;
+    while((b=atomic_fetch_add(&band_cursor,1u))<nbands)fill_band(obj,b);
 }
 
-for(uint8_t h=0;h<edge_count;h++)free(edge_pixels[h]);
-free(scanline_pixels);
-}
-  
-}
-
-
-void* rasterization_worker(void* args){
-
-size_t current_triangle_pointer=atomic_fetch_add(&triangle_tracker,3);
-Object obj=*(get_current_object());    
-
-while(current_triangle_pointer<obj.len_of_connectors){
-Vectex triangle[3]={obj.vertices[obj.connectors_sequence[current_triangle_pointer++]],
-obj.vertices[obj.connectors_sequence[current_triangle_pointer++]],
-obj.vertices[obj.connectors_sequence[current_triangle_pointer]]
-};
-rasterizer(triangle,get_current_object());   
-current_triangle_pointer=atomic_fetch_add(&triangle_tracker,3); 
+void rasterization_chunk_reset(uint32_t tid){
+    for(uint32_t b=0;b<nbands;b++)bins[(size_t)tid*nbands+b].n=0;
+    setup_n[tid]=0;
+    if(tid==0)atomic_store(&band_cursor,0u);
 }
 
-}
+uint32_t rasterization_chunk_size(void){ return CHUNK_TRIS; }

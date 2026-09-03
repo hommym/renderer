@@ -111,6 +111,10 @@ void render_init(Object* objs,uint64_t len,uint32_t win_w,uint32_t win_h);
 void set_objects(Object* objs,uint64_t len);
 bool render();
 void renderer_resize(uint32_t win_w,uint32_t win_h);
+
+// Release the two frame buffers and the rasterizer's scratch. After this the
+// renderer is back to its pre-init state and render() returns false.
+void renderer_shutdown(void);
 // Movement is relative to where the camera is looking: MOV_FORWARD follows the
 // gaze including pitch, MOV_LEFT/RIGHT strafe along the horizontal right axis,
 // and MOV_UP/DOWN stay on the world vertical so they cannot be tilted into a
@@ -129,6 +133,11 @@ void move_camera(double unit,Movement direction);
 // Pitch is clamped just short of straight up and straight down: at exactly
 // vertical the horizontal heading is undefined and the view rolls.
 void rotate_camera(double d_yaw,double d_pitch);
+
+// Back to the startup camera: world origin, looking down +z, level. What a
+// model swap calls, so a newly loaded model is framed the way the first one was
+// rather than left off screen behind wherever the viewer had flown to.
+void camera_reset(void);
 Camera get_camera_pos();
 // ---- frame buffers -------------------------------------------------------
 //
@@ -144,18 +153,6 @@ Camera get_camera_pos();
 // clear freed, which meant any caller holding it across a frame was reading
 // memory that had already been released.
 const PixelCord* get_frame_buffer();
-
-// Take the lock covering `row` of the back buffer before touching any of that
-// row's pixels, and release it after. Work is partitioned by triangle, so two
-// threads reach the same pixel routinely, and the depth test there is a
-// read-modify-write that has to be indivisible -- otherwise the farther fragment
-// can win, and a 40-byte PixelCord can be half written by each of two threads.
-//
-// One acquire per triangle-row, not per pixel: the scanline pass already works a
-// row at a time. Rows share a lock when they collide modulo the band count, so a
-// collision costs a short wait rather than a wrong pixel.
-void frame_row_lock(size_t row);
-void frame_row_unlock(size_t row);
 
 // The buffer being drawn into, for the rasterization workers only. Not part of
 // the interface a caller should reach for: it is a half-finished frame.

@@ -10,7 +10,11 @@
 
 
 
+
 // double camera.focal_l=30;
+// The far plane the camera starts with, and the one camera_reset() puts back.
+#define CAMERA_FAR_DEFAULT 15000.0
+
 uint32_t screen_width; //max column on fram_buffer
 uint32_t screen_hieght; // max row on frame_buffer
 static Camera camera={
@@ -19,7 +23,7 @@ static Camera camera={
 0.0,
 0.0,
 0.0,
-15000.0, //default far plane distance
+CAMERA_FAR_DEFAULT, //default far plane distance
 0.0,           // focal_l recomputed in setup_camera
 1.047197551,   // v_fov (const): 60 deg in rad
 0.0,           // h_fov recomputed in setup_camera
@@ -41,40 +45,32 @@ static size_t objects_len=0;
 // that is a 60MB release and a 60MB zeroed allocation per frame, and it handed
 // out a pointer that the next clear silently invalidated -- anything that held
 // on to the result of get_frame_buffer() across a frame was reading freed memory.
-// ---- frame buffer row locks ----------------------------------------------
+// ---- no frame buffer locks -------------------------------------------------
 //
-// Work is handed out by triangle, so two threads routinely land on the same
-// pixel, and the depth test there is a read-modify-write:
+// There used to be 256 cache-line-padded spinlocks here, because work was handed
+// out by TRIANGLE and two threads therefore landed on the same pixel routinely --
+// and the depth test is a read-modify-write that has to be indivisible.
 //
-//     existing = frame_buffer[y][x];   if(closer) frame_buffer[y][x] = pixel;
-//
-// Unsynchronised that loses updates -- both threads read the same `existing`,
-// both conclude they are in front, and the second write clobbers the first -- and
-// it tears, because a PixelCord is 40 bytes and no store that wide is atomic.
-//
-// A lock per pixel is impossible (1.5M of them) and one lock for the whole
-// buffer would remove the point of threading. A lock per ROW BAND is the middle:
-// the scanline pass writes one row at a time, so a whole triangle-row is a
-// single acquire, and two threads only wait on each other when their rows
-// collide modulo FRAME_LOCK_BANDS.
-//
-// Padded to a cache line each. Packed together, locking two different bands
-// would still bounce the same line between cores and reintroduce most of the
-// contention the banding exists to avoid.
-#define FRAME_LOCK_BANDS 256u      // power of two, so the index is a mask
-#define FRAME_LOCK_LINE  64u
-
-typedef struct RowLock {
-    atomic_flag held;
-    char pad[FRAME_LOCK_LINE-sizeof(atomic_flag)];
-} RowLock;
-
-static RowLock row_locks[FRAME_LOCK_BANDS];
+// Work is now handed out by row BAND instead (see rasterization.h), so a pixel
+// has exactly one writer for the whole frame and there is nothing left to
+// serialise. That deleted the locks, which were 28% of the profile, and made the
+// frame bit-exact reproducible at the same time: the depth ties that used to be
+// broken by arrival order are now broken by source-triangle order.
 
 static PixelCord* buffers[2]={NULL,NULL};
 static size_t buffer_cells=0;
 static int back=0;                 // buffers[back] is the one being drawn into
 static int num_core=0; // number of cores the running system has
+
+static uint32_t worker_count=1;
+static pthread_barrier_t frame_bar;
+static bool bar_ready=false;
+
+typedef struct WorkerArg { uint32_t tid; } WorkerArg;
+
+static Object* frame_objects=NULL;
+static size_t  frame_objects_len=0;
+
 
 
 Object* get_current_object(){
@@ -151,23 +147,6 @@ return camera;
 
 
 
-// A spinlock, not a mutex: the critical section is one row of one triangle, so
-// the wait is shorter than the round trip into the kernel that a sleeping lock
-// would pay. There is never more than one thread per core here, so nobody spins
-// waiting for a holder that has been descheduled.
-void frame_row_lock(size_t row){
-RowLock* l=&row_locks[row&(FRAME_LOCK_BANDS-1u)];
-while(atomic_flag_test_and_set_explicit(&l->held,memory_order_acquire)){
-#if defined(__x86_64__)||defined(__i386__)
-    __builtin_ia32_pause();   // stop hammering the cache line while waiting
-#endif
-}
-}
-
-void frame_row_unlock(size_t row){
-atomic_flag_clear_explicit(&row_locks[row&(FRAME_LOCK_BANDS-1u)].held,memory_order_release);
-}
-
 const PixelCord* get_frame_buffer(){
     // the front buffer: the last frame render() finished and swapped in
     return buffers[back^1];
@@ -189,9 +168,13 @@ objects_len=objs==NULL?0:len;   // a NULL array has no elements, whatever len sa
 
 void render_init(Object* objs,uint64_t len,uint32_t win_w,uint32_t win_h){
 // needs to be called once to initialise the renderer
-for(size_t i=0;i<FRAME_LOCK_BANDS;i++)atomic_flag_clear(&row_locks[i].held);
 num_core=get_number_of_cores(); // loading the number of core on system to know number of threads to spawn
-num_core=num_core<0?1:num_core-1;
+num_core=num_core<1?1:num_core;
+if(num_core>64)num_core=64;
+worker_count=(uint32_t)num_core;
+if(bar_ready)pthread_barrier_destroy(&frame_bar);
+pthread_barrier_init(&frame_bar,NULL,worker_count);
+bar_ready=true;
 frame_buffers_alloc(win_w,win_h);
 set_objects(objs,len);
 screen_width=win_w;
@@ -200,85 +183,128 @@ setup_camera();
 }
 
 
+// ---- the frame worker pool -------------------------------------------------
+//
+// Threads are created ONCE PER FRAME rather than once per object. A 61-material
+// model was paying 61 x 7 pthread_create+join every frame, which at ~25us each
+// is 20ms of pure bookkeeping before a single pixel is drawn.
+//
+// Within a frame the workers run in lockstep through three barriers per chunk:
+// setup, then fill, then reset. The barriers are what let the fill pass assume
+// every setup record it might read is already written.
+
+static void frame_work(uint32_t tid){
+    uint32_t chunk=rasterization_chunk_size();
+    for(size_t oi=0;oi<frame_objects_len;oi++){
+        Object* obj=&frame_objects[oi];
+        if(obj->len_of_connectors<3)continue;      // point clouds are drawn before the pool starts
+        uint64_t ntri=obj->len_of_connectors/3;
+        for(uint64_t base=0;base<ntri;base+=chunk){
+            uint64_t hi=base+chunk;
+            if(hi>ntri)hi=ntri;
+
+            rasterization_setup_pass(obj,base,hi,tid);
+            pthread_barrier_wait(&frame_bar);      // every record is now written
+
+            rasterization_fill_pass(obj);
+            pthread_barrier_wait(&frame_bar);      // every band is now filled
+
+            rasterization_chunk_reset(tid);
+            pthread_barrier_wait(&frame_bar);      // bins are empty for the next chunk
+        }
+    }
+}
+
+static void* frame_worker(void* a){
+    frame_work((uint32_t)(uintptr_t)a);
+    return NULL;
+}
+
 bool render(){
 if(buffers[0]==NULL||buffers[1]==NULL)return false;
 
 // rebuild the camera basis once for the whole frame. every vertex is rotated
 // into view space with it, and the rasterization threads only read it.
 view_refresh();
+rasterization_frame_begin();
 
 // Wipe the back buffer rather than reallocating it. .in_use is the occupancy
 // bit, so zeroing is what makes every cell empty again; the front buffer is
 // untouched and keeps showing the last finished frame while this one is drawn.
 memset(buffers[back],0,buffer_cells*sizeof(PixelCord));
 
-PixelCord (*frame_buffer)[screen_width]= (PixelCord (*)[screen_width])buffers[back];   
+PixelCord (*frame_buffer)[screen_width]=(PixelCord (*)[screen_width])buffers[back];
 
-
+// point-cloud objects first, on this thread alone, before any worker exists.
 for(size_t x=0;x<objects_len;x++){
-Object obj=objects[x];
-
-// no connectors -> paint each visible vertex as one pixel. no row lock needed:
-// this path runs on the calling thread and finishes before any worker is
-// spawned, so nothing else is touching the buffer while it writes.
-if(obj.len_of_connectors==0){
+    Object obj=objects[x];
+    if(obj.len_of_connectors!=0)continue;
     size_t w=obj.texture_width;
-    uint32_t (*texture)[w]=(uint32_t (*)[w]) (obj).texture;
+    uint32_t (*texture)[w]=(uint32_t (*)[w])obj.texture;
     for(size_t v=0;v<obj.len_of_vertices;v++){
-        // into the camera's frame first, exactly like the triangle path. a copy,
-        // never in place: obj.vertices is the caller's and is walked every frame.
         Vectex pt=view_apply(obj.vertices[v]);
         PixelCord pc={.z=pt.z,.is_visible=false,.in_use=false,.u=pt.u,.v=pt.v};
-        if(!is_vectex_visible(pt,&pc)) continue;
+        if(!is_vectex_visible(pt,&pc))continue;
         pc.px=perspective_projection(pt.x,pt.z,camera.z,camera.focal_l,camera.x,camera.x_end,screen_width);
         pc.py=perspective_projection(pt.y,pt.z,camera.z,camera.focal_l,camera.y,camera.y_end,screen_hieght);
+        if(pc.px<0||pc.px>=screen_width||pc.py<0||pc.py>=screen_hieght)continue;
         PixelCord point0=frame_buffer[(uint64_t)pc.py][(uint64_t)pc.px];
-        if(point0.in_use && point0.z<pt.z) continue;
+        if(point0.in_use&&point0.z<pt.z)continue;
         pc.in_use=true;
         size_t pc_row=(size_t)(obj.texture_height*pc.v);
         size_t pc_col=(size_t)(obj.texture_width*pc.u);
+        if(pc_row>=obj.texture_height)pc_row=obj.texture_height-1;
+        if(pc_col>=obj.texture_width)pc_col=obj.texture_width-1;
         pc.colour=texture[pc_row][pc_col];
         frame_buffer[(uint64_t)pc.py][(uint64_t)pc.px]=pc;
     }
-    continue;
 }
 
-object=objects+x;    
-atomic_store(&triangle_tracker,0);
-    pthread_t threads[num_core==0?1:num_core]; // Array to hold thread IDs
+// anything with triangles goes through the pool
+bool any_tris=false;
+for(size_t x=0;x<objects_len;x++)if(objects[x].len_of_connectors>=3){any_tris=true;break;}
+if(any_tris){
+    frame_objects=objects;
+    frame_objects_len=objects_len;
+    if(!rasterization_pool_init(worker_count))return false;
 
-    // 1. Create multiple threads in a loop
-    for (long i = 0; i < num_core && num_core>1; i++) {
-        // We cast 'i' to a void* directly to avoid race conditions with local memory
-        if (pthread_create(&threads[i], NULL,rasterization_worker, (void*)i) != 0) {
-            perror("Failed to create thread");
-            return false;
-        }
+    pthread_t threads[64];
+    uint32_t spawned=0;
+    for(uint32_t i=1;i<worker_count;i++){
+        if(pthread_create(&threads[spawned],NULL,frame_worker,(void*)(uintptr_t)i)!=0)break;
+        spawned++;
+    }
+    // a thread that failed to start still has to be waited on by the barrier,
+    // so fall back to a barrier sized to what actually exists
+    if(spawned+1!=worker_count){
+        pthread_barrier_destroy(&frame_bar);
+        pthread_barrier_init(&frame_bar,NULL,spawned+1);
     }
 
-    //using main thread too in rasterization process
-    rasterization_worker(NULL);
-    // 2. Join multiple threads in a separate loop
-    printf("Waiting for threads which are still working to finish to finish...\n");
-    for (int i = 0; i < num_core && num_core>1; i++) {
-        if (pthread_join(threads[i], NULL) != 0) {
-            perror("Failed to join thread");
-            return false;
-        }
+    frame_work(0);                     // this thread is worker 0
+
+    for(uint32_t i=0;i<spawned;i++)pthread_join(threads[i],NULL);
+
+    if(spawned+1!=worker_count){
+        pthread_barrier_destroy(&frame_bar);
+        pthread_barrier_init(&frame_bar,NULL,worker_count);
     }
-    printf("Rasterization Process Done\n");
-
-
 }
 
 // present: the buffer just drawn becomes the one get_frame_buffer() hands out.
-// A pointer swap, so nothing is copied and the frame that was on screen a moment
-// ago becomes the next back buffer.
 back^=1;
 return true;
 }
 
-
+// Everything render_init() and renderer_resize() allocate, released. Nothing
+// else in the program owns any of it, so this is the whole teardown.
+void renderer_shutdown(void){
+    if(bar_ready){ pthread_barrier_destroy(&frame_bar); bar_ready=false; }
+    rasterization_pool_release();
+    frame_buffers_release();
+    objects=NULL;
+    objects_len=0;
+}
 
 void renderer_resize(uint32_t win_w,uint32_t win_h){
     screen_width=win_w;
@@ -286,6 +312,8 @@ void renderer_resize(uint32_t win_w,uint32_t win_h){
     setup_camera();
     // a new size means new buffers; this is the only other place they are made
     frame_buffers_alloc(win_w,win_h);
+    // the band count is derived from the screen height, so the bins go too
+    rasterization_pool_release();
 }
 
 // Slide the whole camera box by (dx,dy,dz). Both ends of every axis move
@@ -329,6 +357,23 @@ void move_camera(double unit,Movement direction){
         break;
     }   
 
+}
+
+// Put the camera back exactly where render_init() left it: at the world origin,
+// looking straight down +z. A model swap needs this -- mesh_import fits every
+// model into the same box, so the new one is always where the old one was, but
+// the camera may have been flown a long way off, and arriving at a blank screen
+// reads as a failed load rather than a moved viewer.
+//
+// The setup_camera() call is load-bearing: the fov extents are derived from the
+// CENTRE of the current box, so zeroing both ends re-centres it on the origin
+// and setup_camera then re-expands them to what startup produced.
+void camera_reset(void){
+    camera.x=0.0; camera.x_end=0.0;
+    camera.y=0.0; camera.y_end=0.0;
+    camera.z=0.0; camera.z_end=CAMERA_FAR_DEFAULT;
+    camera.yaw=0.0; camera.pitch=0.0;
+    setup_camera();
 }
 
 void rotate_camera(double d_yaw,double d_pitch){
