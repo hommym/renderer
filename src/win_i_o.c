@@ -121,6 +121,41 @@ if(win==NULL){
 }
 
 
+// What an untouched frame-buffer cell paints as, and what a partly transparent
+// one is composited against. Named because it is now needed in two places.
+#define BACKGROUND_ARGB 0xFFFFFFFFu
+
+// A texel's alpha is real data, not padding: a base colour texture uses it to cut
+// a leaf out of the quad it is drawn on. 37.7% of the eco house's atlas is fully
+// transparent and another 13.2% is partial, so copying the packed word straight
+// through paints every one of those as solid colour.
+//
+// The composite is done here rather than by handing SDL a blended texture,
+// because SDL would blend the whole surface -- background cells included --
+// against whatever RenderClear left, which is a different operation. Here the
+// background is known and only the cells that need it pay for it.
+//
+// Straight (non-premultiplied) source-over, in sRGB space. Blending in sRGB is
+// not photometrically right, but every other colour operation in this renderer
+// is sRGB-naive too and matching them beats being correct in one place only.
+static uint32_t blend_over_background(uint32_t argb){
+uint32_t a=argb>>24;
+if(a==0xFFu)return argb;                     // the overwhelmingly common case
+if(a==0u)return BACKGROUND_ARGB;
+
+uint32_t ia=255u-a;
+uint32_t br=(BACKGROUND_ARGB>>16)&0xFFu;
+uint32_t bg=(BACKGROUND_ARGB>>8)&0xFFu;
+uint32_t bb=BACKGROUND_ARGB&0xFFu;
+// +127 rounds to nearest rather than truncating, so a fully opaque-equivalent
+// blend cannot come back one level dark
+uint32_t r=(((argb>>16)&0xFFu)*a+br*ia+127u)/255u;
+uint32_t g=(((argb>>8)&0xFFu)*a+bg*ia+127u)/255u;
+uint32_t b=((argb&0xFFu)*a+bb*ia+127u)/255u;
+// the result is opaque: it has already been flattened onto the background
+return 0xFF000000u|(r<<16)|(g<<8)|b;
+}
+
 void update_win(PixelCord* frame_buffer){
 if(win==NULL){
     printf("No window to update\n");
@@ -161,11 +196,12 @@ if(pixel_buffer==NULL || pb_w!=w || pb_h!=h){
 }
 
 // flatten the PixelCord grid into ARGB pixels for SDL.
-// empty cells (never written by render()) paint as white background;
-// occupied cells (.in_use==true) paint with their own .colour.
+// empty cells (never written by render()) paint as the background;
+// occupied cells (.in_use==true) are composited over it by their own alpha.
 size_t total=(size_t)w*(size_t)h;
 for(size_t i=0;i<total;i++){
-    pixel_buffer[i]=frame_buffer[i].in_use ? frame_buffer[i].colour : 0xFFFFFFFF;
+    pixel_buffer[i]=frame_buffer[i].in_use ? blend_over_background(frame_buffer[i].colour)
+                                           : BACKGROUND_ARGB;
 }
 
 SDL_UpdateTexture(sdl_texture,NULL,pixel_buffer,w*(int)sizeof(uint32_t));
