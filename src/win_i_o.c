@@ -5,8 +5,15 @@
 #include "win_i_o.h"
 
 // this file contains code for windows,event,input/output management
+
+// How far the camera turns per pixel of mouse movement while dragging. 0.004
+// rad/px puts a full 90 degree turn at roughly 400 pixels of drag, which is
+// about a third of the window -- fast enough to look around without overshooting.
+#define LOOK_RADIANS_PER_PIXEL 0.004
+
 SDL_Window* win=NULL;
 static bool is_proc_running=true;
+static bool is_dragging=false;      // left button held: mouse motion turns the camera
 static SDL_Renderer* sdl_renderer=NULL;
 static SDL_Texture* sdl_texture=NULL;
 static int tex_w=0;
@@ -33,14 +40,28 @@ if(win==NULL){
     while (is_proc_running)
     {
         SDL_Event event;
-        while (SDL_PollEvent(&event))
-        {
-            
+        // Block until something actually happens. Polling in a bare loop spins a
+        // core at 100% doing nothing, which matters more now that a frame is
+        // expensive enough to be worth not wasting cycles around.
+        if(!SDL_WaitEvent(&event))continue;
+
+        // Everything the batch below wants to do, accumulated rather than acted
+        // on. A drag delivers mouse motion at the mouse's polling rate -- often
+        // several hundred events a second -- and a frame here costs tens of
+        // milliseconds, so rendering per event would queue up work faster than
+        // it drains and the view would lag seconds behind the cursor. Draining
+        // the queue first and drawing ONCE keeps the camera on the pointer:
+        // frames are dropped, not stacked.
+        bool needs_redraw=false;
+        double pending_yaw=0.0,pending_pitch=0.0;
+
+        do{
             switch (event.type)
             {
             case SDL_EVENT_WINDOW_CLOSE_REQUESTED:
                 SDL_DestroyWindow(win);
                 SDL_Quit();
+                win=NULL;
                 is_proc_running=false;
                 printf("Window destroyed\n");
                 break;
@@ -55,65 +76,73 @@ if(win==NULL){
                     get_window_size(&nw, &nh);
                     printf("Window size changed to %dx%d\n", nw, nh);
                     renderer_resize((uint32_t)nw, (uint32_t)nh);
-                    render();
                 }
-                update_win(get_frame_buffer());
+                needs_redraw=true;
+                break;
+
+            case SDL_EVENT_MOUSE_BUTTON_DOWN:
+                if(event.button.button==SDL_BUTTON_LEFT){
+                    is_dragging=true;
+                    // keep receiving motion even when the pointer leaves the
+                    // window, so a long drag does not stop at the edge
+                    SDL_CaptureMouse(true);
+                }
+                break;
+            case SDL_EVENT_MOUSE_BUTTON_UP:
+                if(event.button.button==SDL_BUTTON_LEFT){
+                    is_dragging=false;
+                    SDL_CaptureMouse(false);
+                }
                 break;
             case SDL_EVENT_MOUSE_MOTION:
-                printf("Mouse is moving\n");
+                if(is_dragging){
+                    // xrel/yrel are the movement since the last motion event, so
+                    // they add up across a batch exactly as one long drag would.
+                    // y is negated: pushing the mouse down should look down, and
+                    // positive pitch is up.
+                    pending_yaw   += event.motion.xrel*LOOK_RADIANS_PER_PIXEL;
+                    pending_pitch -= event.motion.yrel*LOOK_RADIANS_PER_PIXEL;
+                    needs_redraw=true;
+                }
                 break;
-            case SDL_EVENT_MOUSE_BUTTON_DOWN:
-                printf("Mouse button pressed\n");
-                break;
+
             case SDL_EVENT_MOUSE_WHEEL:
                 // event.wheel.y > 0 -> scroll up / away from user  -> forward
                 // event.wheel.y < 0 -> scroll down / toward user   -> backward
-                if(event.wheel.y > 0){
-                    printf("Scroll up (forward)\n");
-                    move_camera(30,MOV_FORWARD);
-                }
-                else if(event.wheel.y < 0){
-                    printf("Scroll down (backward)\n");
-                    move_camera(30,MOV_BACKWARD);
-                }
-                clear_frame_buffer(false);
-                render();
-                update_win(get_frame_buffer());
+                // forward now follows where the camera is looking, not +z.
+                if(event.wheel.y > 0)move_camera(30,MOV_FORWARD);
+                else if(event.wheel.y < 0)move_camera(30,MOV_BACKWARD);
+                needs_redraw=true;
                 break;
-            case SDL_EVENT_KEY_DOWN:
-                // for handling arrow keys press
-                if(!event.key.repeat){
-                       switch (event.key.key)
-                {
-                case SDLK_LEFT:
-                    // call your camera / scene handler for LEFT here
-                    printf("Left Arrow key pressed\n");
-                    move_camera(30,MOV_LEFT);
-                    break;
-                case SDLK_RIGHT:
-                    // call your camera / scene handler for RIGHT here
-                    printf("Right Arrow key pressed\n");
-                    move_camera(30,MOV_RIGHT);
-                    break;
-                case SDLK_UP:
-                    // call your camera / scene handler for UP here
-                    printf("Up Arrow key pressed\n");
-                    move_camera(30,MOV_UP);
-                    break;
-                case SDLK_DOWN:
-                    // call your camera / scene handler for DOWN here
-                    printf("Down Arrow key pressed\n");
-                    move_camera(30,MOV_DOWN);
-                    break;
-                }
 
-                 clear_frame_buffer(false);
-                 render();
-                 update_win(get_frame_buffer());
+            case SDL_EVENT_KEY_DOWN:
+                // held keys repeat, and each repeat is a step: that is what makes
+                // holding an arrow glide instead of nudging once.
+                switch (event.key.key)
+                {
+                case SDLK_LEFT:   move_camera(30,MOV_LEFT);     needs_redraw=true; break;
+                case SDLK_RIGHT:  move_camera(30,MOV_RIGHT);    needs_redraw=true; break;
+                case SDLK_UP:     move_camera(30,MOV_UP);       needs_redraw=true; break;
+                case SDLK_DOWN:   move_camera(30,MOV_DOWN);     needs_redraw=true; break;
+                case SDLK_W:      move_camera(30,MOV_FORWARD);  needs_redraw=true; break;
+                case SDLK_S:      move_camera(30,MOV_BACKWARD); needs_redraw=true; break;
+                case SDLK_A:      move_camera(30,MOV_LEFT);     needs_redraw=true; break;
+                case SDLK_D:      move_camera(30,MOV_RIGHT);    needs_redraw=true; break;
+                case SDLK_ESCAPE:
+                    is_dragging=false;
+                    SDL_CaptureMouse(false);
+                    break;
                 }
-               
                 break;
             }
+        }while(is_proc_running && SDL_PollEvent(&event));
+
+        if(is_proc_running && needs_redraw){
+            if(pending_yaw!=0.0 || pending_pitch!=0.0)
+                rotate_camera(pending_yaw,pending_pitch);
+            clear_frame_buffer(false);
+            render();
+            update_win(get_frame_buffer());
         }
         
     }
