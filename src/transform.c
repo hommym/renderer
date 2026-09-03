@@ -65,6 +65,10 @@ camera_eye(view.eye);
 basis_from_angles(c.yaw,c.pitch,view.fwd,view.right,view.down);
 }
 
+const double* view_eye(void){
+return view.eye;
+}
+
 Vectex view_apply(Vectex v){
 double dx=v.x-view.eye[0];
 double dy=v.y-view.eye[1];

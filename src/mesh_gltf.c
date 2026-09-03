@@ -64,6 +64,7 @@ typedef struct Bucket {
     Vectex* verts;  size_t nverts, cap_verts;
     uint64_t* idx;  size_t nidx,   cap_idx;
     size_t   img;   bool   has_img;
+    bool     double_sided;
     uint32_t flat;                       // baseColorFactor, for when the image is unusable
 } Bucket;
 
@@ -550,13 +551,19 @@ static bool image_load(Ctx* c,size_t ii,Image* img){
 // names no material -- glTF then says to draw it with the default material,
 // which is plain white.
 static bool prim_material(Ctx* c,const JsonValue* prim,size_t* mat,
-                          size_t* img,bool* has_img,uint32_t* flat,size_t* uvset){
+                          size_t* img,bool* has_img,uint32_t* flat,size_t* uvset,
+                          bool* two_sided){
     *has_img=false;
     *flat=0xFFFFFFFFu;
     *uvset=0;
+    // glTF defaults doubleSided to false, and a primitive with no material at
+    // all takes the default material, which is single sided.
+    *two_sided=false;
     if(!json_size(json_member(prim,"material"),mat))return false;
     if(json_type(c->materials)!=JSON_ARRAY||*mat>=json_count(c->materials))return false;
-    const JsonValue* pbr=json_member(json_at(c->materials,*mat),"pbrMetallicRoughness");
+    const JsonValue* matv=json_at(c->materials,*mat);
+    *two_sided=json_bool(json_member(matv,"doubleSided"),false);
+    const JsonValue* pbr=json_member(matv,"pbrMetallicRoughness");
 
     double f[4]={1.0,1.0,1.0,1.0};
     const JsonValue* bcf=json_member(pbr,"baseColorFactor");
@@ -611,6 +618,7 @@ static MeshResult build_scene(Ctx* c,Model* out){
         o->len_of_vertices=b->nverts;
         o->connectors_sequence=b->idx;
         o->len_of_connectors=b->nidx;
+        o->double_sided=b->double_sided;
         b->verts=NULL;b->idx=NULL;             // ownership moves to the Object
 
         uint32_t* px=NULL;
@@ -675,6 +683,10 @@ static MeshResult merge_scene(Model* sc,Object* out){
     }
 
     uint32_t* keep=sc->objects[best].texture;
+    // merging loses the per-material distinction, so the merged Object can only
+    // be culled if every material it swallowed agreed it was safe
+    out->double_sided=false;
+    for(size_t i=0;i<sc->len;i++)if(sc->objects[i].double_sided)out->double_sided=true;
     out->texture=keep;
     out->texture_width=sc->objects[best].texture_width;
     out->texture_height=sc->objects[best].texture_height;
@@ -768,9 +780,9 @@ static MeshResult emit_primitive(Ctx* c,const JsonValue* prim,const double m[16]
     // the material decides which TEXCOORD_n to read, so it has to be settled
     // before the attribute is looked up
     size_t mat=0,img=0,uvset=0;
-    bool has_img=false;
+    bool has_img=false,two_sided=false;
     uint32_t flat=0;
-    if(!prim_material(c,prim,&mat,&img,&has_img,&flat,&uvset)||mat>=c->nmaterials)
+    if(!prim_material(c,prim,&mat,&img,&has_img,&flat,&uvset,&two_sided)||mat>=c->nmaterials)
         mat=c->nmaterials;                     // the catch-all bucket
 
     Accessor uv;
@@ -810,6 +822,7 @@ static MeshResult emit_primitive(Ctx* c,const JsonValue* prim,const double m[16]
 
     Bucket* bk=&c->buckets[mat];
     if(has_img&&img<c->nimages){ bk->img=img; bk->has_img=true; }
+    if(two_sided)bk->double_sided=true;
     if(flat)bk->flat=flat;
 
     size_t base=bk->nverts,vneed,ineed;

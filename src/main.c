@@ -10,7 +10,7 @@
 // roughly 1 unit tall -- and this camera is a fixed pinhole at the world origin,
 // so without a fit pass a model is either a speck or swallows the screen.
 // note the spelling: the file is appartement.glb, not appartment.glb
-#define MODEL_PATH "/home/arthur-herberth/Documents/models/corrupted_archangel_six_wings_boss.glb"
+#define MODEL_PATH "/home/arthur-herberth/Documents/models/appartement/source/appartement.glb"
 
 #define MODEL_EXTENT   420.0
 #define MODEL_CENTRE_X 180.0     // right of centre; the cube sits on the left

@@ -42,6 +42,10 @@ Vectex view_apply(Vectex v);
 // anything that runs per vertex.
 void camera_axes(double fwd[3], double right[3], double down[3]);
 
+// The eye from the last view_refresh(), without recomputing it or copying a
+// Camera. For per-triangle work, where camera_eye()'s struct copy would show up.
+const double* view_eye(void);
+
 // Where the eye actually is. The Camera stores the far-plane extents, and the
 // eye sits at the centre of that box, so this is not just (camera.x, y, z).
 void camera_eye(double eye[3]);

@@ -53,6 +53,12 @@ typedef struct Object
     size_t    texture_width;
     size_t    texture_height;
 
+    // True when the material is meant to be visible from both sides, and the
+    // back-face cull must therefore leave it alone. glTF says this per material
+    // (`doubleSided`); formats with no such concept set it true, because "we
+    // cannot tell" has to mean "do not throw geometry away".
+    bool double_sided;
+
 } Object;
 
 
@@ -110,6 +116,14 @@ void renderer_resize(uint32_t win_w,uint32_t win_h);
 // gaze including pitch, MOV_LEFT/RIGHT strafe along the horizontal right axis,
 // and MOV_UP/DOWN stay on the world vertical so they cannot be tilted into a
 // dive.
+// Force the back-face cull on for every object, ignoring double_sided. Exporters
+// set doubleSided by default whether or not the mesh needs it, so a closed model
+// often carries the flag while losing nothing to a cull -- measured at 0.02% of
+// pixels on the archangel for a third off the frame time. Off by default,
+// because on open geometry (foliage cards, single-sided walls) it deletes
+// surfaces that should be there.
+void set_backface_cull_forced(bool on);
+
 void move_camera(double unit,Movement direction);
 
 // Turn the camera in place. Deltas in radians, added to the current angles.

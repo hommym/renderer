@@ -141,6 +141,36 @@ The clip bounds magnification at `focal_l / margin` and guarantees a positive di
 
 ---
 
+### Back-face culling
+
+Roughly half the triangles of a closed mesh point away from the eye. They were
+always discarded eventually -- by the depth test -- but only after paying for a
+clip, three projections, three Bresenham walks and a full scanline fill.
+
+The test is the sign of `N . (a - eye)`, where `N = (b-a) x (c-a)` is the plane
+normal: it says which side of the triangle's plane the eye is on, which is the
+same question as which face it can see. No projection and no division.
+
+Two things about where it sits:
+
+**Before the near-plane clip, not after.** Clipping only cuts a triangle up
+within its own plane, so every piece it produces has the same normal and the
+same facing as the whole. One test on the source triangle covers all of them --
+and it sidesteps the fact that `clip_triangle_near` does not preserve winding
+(`issues.md` 5).
+
+**Gated on `Object.double_sided`.** glTF marks materials `doubleSided`, and a
+material that says so must not be culled -- foliage cards and single-sided walls
+are modelled from one side only and vanish otherwise. PLY and OBJ carry no such
+concept, so they are treated as double sided: "we cannot tell" has to mean "do
+not throw geometry away".
+
+`set_backface_cull_forced(true)` overrides the flag for the cases where an
+exporter set it by default on a mesh that does not need it. `issues.md` 12 has
+the measured cost per model.
+
+---
+
 ### View transform
 
 The camera can turn, and **nothing downstream of the transform knows it can**.
@@ -321,7 +351,6 @@ A texture path read out of a model file is resolved against that file's own dire
 ## 10. Deliberate omissions (see `issues.md`)
 
 - No matrix pipeline → no camera rotation, no per-object transform.
-- No back-face culling.
 - No perspective-correct interpolation.
 - No wireframe rendering. Dropped deliberately when rasterization moved to `rasterization.c`; the Bresenham walker remains as a triangle-edge utility.
 - No explicit primitive tag on `Object` — dispatch infers it from connector count, and nothing records indices-per-primitive.

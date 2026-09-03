@@ -70,13 +70,26 @@ becomes a matrix like any other.
 
 ---
 
-## 5. No back-face culling
+## 5. `clip_triangle_near` does not preserve winding
 
-**What breaks.** Every triangle of a closed mesh is rasterized, including the roughly half facing away from the camera. They are then discarded by the depth compare, so the output is correct but up to twice the fill work is wasted — and under issue 1, back faces are extra contention on the same pixels.
+**What breaks.** Nothing today, but it rules out any test that needs to know
+which way a clipped triangle faces.
 
-**Why.** There is no winding-order test. `clip_triangle_near` also does not preserve winding when it splits a triangle, so a culling test would need to establish orientation from the projected vertices rather than trusting index order.
+**Why.** The clip sorts vertices into `inside[]`/`outside[]` in *index* order,
+which loses their cyclic position. In the one-corner-survives case with the
+surviving corner at index 1, the two generated vertices come out swapped and the
+output triangle is wound the opposite way from its input; the two-corner case has
+the same problem for some orientations.
 
-**Fix path.** After projecting the three vertices, take the sign of the 2D cross product of two edges and skip triangles facing away. Decide a winding convention first, and make the clip respect it.
+The back-face cull dodges this by testing before the clip rather than after:
+clipping only cuts a triangle up within its own plane, so every piece has the
+same normal and the same facing as the whole, and one test on the source
+triangle covers all of them.
+
+**Fix path.** Replace the branchy sort with a Sutherland-Hodgman walk, which is
+winding-preserving by construction and shorter than what is there now: step the
+three edges in order, emit each inside vertex, and emit a crossing wherever an
+edge changes side. Three or four vertices come back; fan-triangulate them.
 
 ---
 
@@ -179,3 +192,40 @@ The blanket refusal is right in principle — a required extension may change th
 Measured over the current model set, `dae_-_eco_house.glb` is the case that has it: **37.7%** of its dominant texture is fully transparent and another **13.2%** is partially transparent; 27.8% of its vertices sample a fully transparent texel. Every other model in the set is fully opaque, which is why this has not shown up as an obvious defect yet.
 
 **Fix path.** The cheap version is an alpha cutout: at the sample site, `if((texel>>24) < 128) continue;` — skip the pixel entirely so it is neither painted nor depth-written. That is what a cutout material wants and it costs one comparison. True alpha blending needs the triangles sorted back-to-front, which the current z-buffer-only pipeline has no machinery for.
+
+---
+
+## 12. Every material in the current model set is marked `doubleSided`
+
+**What breaks.** Back-face culling never engages on any model that is loaded
+today, so none of them get the roughly one third off frame time it offers.
+
+**Why.** The cull honours glTF's per-material `doubleSided` flag, and all 47
+materials across the model set set it to true. That is almost certainly exporter
+default rather than intent -- Blender's glTF exporter writes `doubleSided: true`
+whenever a material's "Backface Culling" box is unticked, which is the default --
+but the file says what it says and guessing against it deletes geometry.
+
+`set_backface_cull_forced(true)` overrides it. What that costs, measured against
+the unculled render at 900x700:
+
+| model | pixels changed | frame time |
+| --- | --- | --- |
+| `corrupted_archangel` (1.96M tris) | 154 (**0.02%**) | 418 -> 263 ms |
+| `fallen_paladin` (1.99M tris) | 129 (**0.02%**) | 418 -> 275 ms |
+| `model.glb` tree (845k tris) | 490 (**0.08%**) | 204 -> 120 ms |
+| `dae_-_eco_house` (124k tris) | 26,054 (**4.14%**) | 57 -> 41 ms |
+| `shareModel.obj` castle (1M tris) | 52,730 (**8.37%**) | 205 -> 123 ms |
+
+The closed character meshes lose nothing measurable -- 0.02% is the depth-test
+noise floor from issue 1 -- and run a third faster. The eco house loses foliage
+cards seen from behind, which are genuinely single-sided geometry the flag is
+there to protect. The castle is worse than either: it is a photogrammetry scan
+with inconsistently wound triangles, so culling shreds its top surface into
+patches rather than removing a coherent set of back faces.
+
+**Fix path.** Nothing to fix in the renderer -- the flag is being honoured
+correctly. What would help is deciding per model: force it on for closed meshes,
+leave it off for scans and foliage. A per-Object override set at import time from
+something better than the exporter default (a triangle-adjacency check for
+"is this mesh closed and consistently wound") would make it automatic.

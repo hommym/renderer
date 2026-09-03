@@ -163,10 +163,14 @@ if(f==MESH_FORMAT_GLTF||f==MESH_FORMAT_GLB){
 Object one={0};
 MeshResult r=mesh_load(path,&one);
 if(r!=MESH_OK)return r;
+one.double_sided=true;
 Object* objs=malloc(sizeof *objs);
 uint32_t** texs=malloc(sizeof *texs);
 if(!objs||!texs){ free(objs); free(texs); mesh_free(&one); return MESH_ERR_OOM; }
 objs[0]=one;
+// ply and obj carry no sidedness at all, and guessing "single sided" would
+// silently delete half of any open mesh
+objs[0].double_sided=true;
 texs[0]=one.texture;
 out->objects=objs;out->len=1;
 out->textures=texs;out->texture_count=1;

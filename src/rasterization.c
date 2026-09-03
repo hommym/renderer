@@ -13,6 +13,19 @@
 // geometry projects inverted instead of disappearing.
 #define NEAR_PLANE_MARGIN 1.0
 
+// Which sign of the facing test means "away from the eye". Determined by the
+// winding the loaders end up producing, which is glTF/OBJ counter-clockwise put
+// through mesh_fit_to_view's y mirror -- so it is measured, not assumed. See the
+// commit that added this.
+// Measured, not assumed: with sign -1 the culled render differs from the
+// unculled one by 0.02% of pixels on the archangel and 0.10% on the tree, which
+// is the depth-test noise floor. With +1 it differs by 9.88% and 5.90% -- the
+// inside of the model, drawn instead of the outside.
+#define BACKFACE_SIGN (-1.0)
+
+// Set by set_backface_cull_forced(). Read-only during a frame.
+static bool cull_forced=false;
+
 // Walk t of the way from a to b, in world space and in colour.
 static Vectex lerp_vectex(Vectex a,Vectex b,double t){
 if(t<0.0)t=0.0;
@@ -110,6 +123,40 @@ return (*pxcord_p).is_visible;
 
 
 
+// Which way a triangle faces, as seen from the eye.
+//
+// N = (b-a) x (c-a) is the triangle's plane normal, and the sign of
+// N . (a - eye) says which side of that plane the eye is on -- which is the same
+// question as which of the two faces it can see. No projection needed, and no
+// division.
+//
+// Done BEFORE the near-plane clip on purpose. Clipping only cuts a triangle up
+// within its own plane, so every piece it produces has the same normal and the
+// same facing as the whole. One test per source triangle covers all of them, and
+// it sidesteps the fact that clip_triangle_near does not preserve winding.
+//
+// A degenerate triangle gives N = 0 and a dot product of 0, so it falls through
+// and is drawn. It covers no area anyway, and treating "no normal" as "facing
+// away" would quietly drop slivers that are only degenerate to rounding.
+static bool is_back_facing(const Vectex t[3]){
+const double* eye=view_eye();
+
+double ax=t[1].x-t[0].x, ay=t[1].y-t[0].y, az=t[1].z-t[0].z;
+double bx=t[2].x-t[0].x, by=t[2].y-t[0].y, bz=t[2].z-t[0].z;
+
+double nx=ay*bz-az*by;
+double ny=az*bx-ax*bz;
+double nz=ax*by-ay*bx;
+
+double ex=t[0].x-eye[0], ey=t[0].y-eye[1], ez=t[0].z-eye[2];
+
+return (nx*ex+ny*ey+nz*ez)*BACKFACE_SIGN > 0.0;
+}
+
+void set_backface_cull_forced(bool on){
+cull_forced=on;
+}
+
 static void rasterizer(Vectex source_triangle[3],Object* obj){
 PixelCord (*frame_buffer)[screen_width]= (PixelCord (*)[screen_width])get_frame_buffer(); 
 size_t w=(*obj).texture_width;
@@ -124,6 +171,12 @@ uint32_t (*texture)[w]=(uint32_t (*)[w]) (*obj).texture;
 Vectex view_triangle[3]={view_apply(source_triangle[0]),
                          view_apply(source_triangle[1]),
                          view_apply(source_triangle[2])};
+
+// roughly half the triangles of a closed mesh point away from the eye. they are
+// currently correct but wasted: the depth test throws every one of them away
+// after paying for a clip, three projections, three bresenham walks and a full
+// scanline fill.
+if((cull_forced||!(*obj).double_sided)&&is_back_facing(view_triangle))return;
 
 // clip against the near plane before projecting. a vertex at or behind the
 // get_camera_pos() has no meaningful projection, so it has to be replaced by the point
