@@ -308,7 +308,10 @@ for(;;){
         char* end;
         strtod(q,&end);
         bool numeric=(end!=q&&(*end==' '||*end=='\t'||*end=='\r'||*end=='\0'));
-        bool flag=(strncmp(q,"on",2)==0||strncmp(q,"off",3)==0);
+        // the whole token, not a prefix: "onyx.png" and "offset_map.png" are
+        // filenames, and matching them as the on/off flag swallows the name
+        size_t tok=(size_t)(skip_token(q)-q);
+        bool flag=(tok==2&&strncmp(q,"on",2)==0)||(tok==3&&strncmp(q,"off",3)==0);
         if(!numeric&&!flag)break;   // not an argument: this is the filename
         p=skip_token(q);
     }
@@ -344,7 +347,9 @@ for(;;){
             char* rel=parse_map_kd(p+6);
             // a texture path is resolved against the MTL's directory, not the
             // obj's -- they are usually the same but nothing requires it
-            if(rel)cur->map_kd=mesh_path_sibling(path,rel);
+            if(rel)cur->map_kd=mesh_texture_sibling(path,rel);
+            if(rel&&!cur->map_kd)
+                printf("mesh: %s: map_Kd '%s' could not be resolved\n",path,rel);
             free(rel);
         }
     }else if(cur&&p[0]=='K'&&p[1]=='d'&&(p[2]==' '||p[2]=='\t')){
@@ -563,7 +568,17 @@ if(best&&best->map_kd&&image_decode_file(best->map_kd,MESH_TEXTURE_MAX_DIM,&img,
     out->texture=img.pixels;
     out->texture_width=img.width;
     out->texture_height=img.height;
-}else if(!mesh_set_flat_texture(out,best?best->kd:MESH_DEFAULT_COLOUR)){
+}else{
+    // A flat 1x1 texture is what "this model is grey" looks like from the
+    // outside, and until now the three reasons for it were indistinguishable.
+    // Say which one it was: shareModel.obj is grey because the mtl it names is
+    // simply not on disk, and that took a filesystem search to find out.
+    if(best&&best->map_kd)printf("mesh: could not decode texture '%s'\n",best->map_kd);
+    else if(mats.len==0)  printf("mesh: no material library loaded (missing or unreadable mtllib) -- using a flat colour\n");
+    else                  printf("mesh: material '%s' names no map_Kd -- using its flat Kd colour\n",
+                                 best&&best->name?best->name:"(unnamed)");
+}
+if(out->texture==NULL&&!mesh_set_flat_texture(out,best?best->kd:MESH_DEFAULT_COLOUR)){
     mat_free(&mats);
     free(vb.data);
     free(ib.data);

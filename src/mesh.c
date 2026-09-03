@@ -247,6 +247,38 @@ for(size_t i=dir;i<dir+n;i++)if(full[i]=='\\')full[i]='/';
 return full;
 }
 
+static bool file_exists(const char* p){
+FILE* f=fopen(p,"rb");
+if(!f)return false;
+fclose(f);
+return true;
+}
+
+char* mesh_texture_sibling(const char* base_path,const char* rel){
+if(!base_path||!rel||!*rel)return NULL;
+
+// the path as the file writes it, when that is already a sibling
+char* full=mesh_path_sibling(base_path,rel);
+if(full){
+    if(file_exists(full))return full;
+    free(full);
+}
+
+// otherwise its last component. "C:\\Textures\\wall.png" and "../tex/wall.png"
+// both become "wall.png", which is where an exported model's textures sit far
+// more often than not.
+const char* base=rel;
+for(const char* q=rel;*q;q++)if(*q=='/'||*q=='\\')base=q+1;
+if(base==rel||!*base)return NULL;         // no directory part: nothing new to try
+
+full=mesh_path_sibling(base_path,base);
+if(full){
+    if(file_exists(full))return full;
+    free(full);
+}
+return NULL;
+}
+
 bool mesh_set_flat_texture(Object* obj,uint32_t argb){
 if(!obj)return false;
 Image img={0};
