@@ -9,33 +9,44 @@ Design notes for the renderer. Companion to `issues.md` — that file tracks wha
 | File | Responsibility |
 | --- | --- |
 | `src/renderer.c` | Renderer state (camera, frame buffer, object list), `render()` dispatch, thread pool lifecycle |
-| `src/rasterization.c` | Near-plane clip, projection, scanline triangle fill. The worker body. |
-| `src/wireframe.c` | `bresenhame_line_algo` — walks one segment, emits one `PixelCord` per step with interpolated z and texture coordinates |
+| `src/rasterization.c` | Near-plane clip, projection, binning, scanline triangle fill. Both worker passes. |
+| `src/wireframe.c` | `bresenhame_line_algo` — walks one segment, emits one `PixelCord` per step. **No longer on the frame path**: the edge-walk rasterizer replaced it. Kept as a line utility. |
 | `src/projection.c` | `perspective_projection` — one axis of the perspective divide |
 | `src/interpolation.c` | Scalar and per-channel colour lerps |
 | `src/transform.c` | Camera basis and the world-to-view step |
-| `src/utils.c` | `sort_pixelcords_by_px` (insertion sort), `get_number_of_cores` |
-| `src/win_i_o.c` | SDL window, event loop, frame-buffer → texture blit |
+| `src/utils.c` | `sort_pixelcords_by_px` (insertion sort, no longer on the frame path), `get_number_of_cores` |
+| `src/win_i_o.c` | SDL window, event loop, frame-buffer → texture upload, present |
+| `src/ui.c` | In-window model browser (§12). Owns the loaded `Model`. |
 | `src/mesh*.c`, `src/json.c` | Mesh file loading — see §9 |
 | `src/image.c` | Format sniff and the packed-ARGB conversion both decoders feed |
 | `src/png.c`, `src/inflate.c` | PNG container and DEFLATE/zlib (RFC 1951/1950) |
 | `src/jpeg.c` | Baseline JPEG (T.81 sequential DCT, Huffman, 8-bit) |
 
-`renderer.c` owns the state; `rasterization.c` reaches it through `get_camera_pos()`, `get_frame_buffer()`, `get_current_object()` and the `screen_width` / `screen_hieght` externs.
+`renderer.c` owns the state. `rasterization.c` snapshots the camera once per frame in `rasterization_frame_begin()` rather than calling `get_camera_pos()` per vertex — it was being called 2.94M times a frame for 95K triangles, each one a ~104-byte struct copy.
 
 ---
 
 ## 2. Pipeline
 
 ```
-Object[] ──▶ render() ──┬─▶ point-cloud path      (single-threaded)
-                        └─▶ rasterization_worker  (thread pool)
-                                │
-                                ├─ clip_triangle_near   world space, against z = camera.z + 1
-                                ├─ perspective_projection   world ──▶ pixel
-                                ├─ bresenhame_line_algo x3   one strip per edge
-                                ├─ scanline gather      cursor per edge, monotonic in py
-                                └─ span fill + depth test ──▶ PixelCord grid (`frame`)
+Object[] ──▶ render() ──┬─▶ point-cloud path   (calling thread, before any worker)
+                        └─▶ frame worker pool  (spawned once per FRAME)
+                               │
+                               │  per object, per chunk of 32768 triangles:
+                               │
+                               ├─ PASS A  setup, parallel by TRIANGLE
+                               │    ├─ view_apply x3         world ──▶ view space
+                               │    ├─ back-face cull        sign(N · (a − eye))
+                               │    ├─ clip_triangle_near    against z = camera.z + 1
+                               │    ├─ project x3            with 1/w in hand
+                               │    ├─ screen bbox reject
+                               │    └─ bin by row band       into this thread's own bins
+                               │  ─────── barrier ───────
+                               ├─ PASS B  fill, parallel by ROW BAND
+                               │    ├─ sort 3 verts by y, walk the two active edges
+                               │    └─ span fill + depth test ──▶ PixelCord grid
+                               │  ─────── barrier ───────
+                               └─ reset bins
 ```
 
 Dispatch is by connector count, not by an explicit tag:
@@ -46,7 +57,10 @@ for obj in objects:
     else:                           triangle raster path (3 indices per triangle)
 ```
 
-**Wireframe mode is no longer supported.** `render()` has no mode flag and there is no dispatch to a line path; the renderer draws point clouds and filled triangles only. `bresenhame_line_algo` survives as the edge walker inside the triangle path, which is now its only caller.
+**Wireframe mode is no longer supported.** `render()` has no mode flag and there
+is no dispatch to a line path; the renderer draws point clouds and filled
+triangles only. `bresenhame_line_algo` is no longer called by anything — the
+edge-walk rasterizer (§8) replaced it — and survives only as a line utility.
 
 ---
 
@@ -55,8 +69,9 @@ for obj in objects:
 - `render_init(objs, len, win_w, win_h)` — allocates the frame buffer, records the object array and screen size, derives the camera lens, and caches the worker count. Call once.
 - `set_objects(objs, len)` — re-point the renderer at the caller's object array. See §9. Not safe to call concurrently with `render()`.
 - `render()` — walks every `Object` and fills the frame buffer. Returns false only if the frame buffer is NULL.
-- `clear_frame_buffer(keep_frame)` — allocates a fresh grid at the current screen size. `keep_frame == true` is currently broken (`issues.md` §7).
-- `renderer_resize(win_w, win_h)` — updates screen size, re-derives the camera, reallocates the frame buffer.
+- `renderer_resize(win_w, win_h)` — updates screen size, re-derives the camera, reallocates both frame buffers and drops the rasterizer's bins (the band count follows screen height).
+- `camera_reset()` — back to the startup camera. What a model swap calls.
+- `renderer_shutdown()` — releases both frame buffers and the rasterizer scratch.
 - `move_camera(unit, direction)` — translates the camera by `unit` world units along one axis. Near value and matching far-plane extent shift together, so the view volume slides rigidly. Does *not* clear the frame buffer; the caller does that.
 - `get_camera_pos()` — snapshot copy of the `Camera`. Mutating the result does nothing.
 - `get_frame_buffer()` — raw pointer to the `PixelCord` grid.
@@ -66,72 +81,86 @@ for obj in objects:
 
 ## 4. Threading model
 
-Work is partitioned **by triangle**, using a shared atomic cursor rather than a precomputed split:
+Work is partitioned **twice**, and which axis is used is the whole design.
 
-- `render_init` sets `num_core = get_number_of_cores() - 1` (one less, because the main thread also rasterizes).
-- Per object, `render()` resets `triangle_tracker` to 0, spawns `num_core` workers, runs `rasterization_worker` on the main thread too, then joins.
-- Each worker calls `atomic_fetch_add(&triangle_tracker, 3)` to claim the next triangle, so chunks are handed out as 0, 3, 6, … Threads that finish a cheap triangle immediately claim another — self-balancing, which matters because triangle cost varies by orders of magnitude with screen area.
-- `object` and the frame buffer are published before `pthread_create` and read after `pthread_join`, so those are ordered. **The frame buffer itself is not synchronised** — this is the significant open bug, `issues.md` §1.
+**Threads are created once per FRAME**, not once per object. A 61-material model
+was paying 61 × 7 `pthread_create` + `pthread_join` every frame — at ~25 µs each
+that is 20 ms of bookkeeping before a pixel is drawn.
 
-Only the triangle path is threaded. The point-cloud path runs on the calling thread.
+Inside a frame, each object is processed in chunks of 32768 source triangles, and
+each chunk runs two passes separated by `pthread_barrier_wait`:
 
----
+**Pass A — setup, partitioned by TRIANGLE.** Thread `t` takes a *statically
+assigned, contiguous* range of the chunk. It transforms, culls, clips, projects
+and screen-bbox-rejects each triangle, writes the survivors into **its own slice**
+of a shared setup array, and records each survivor's index in **its own bins**,
+one per row band it touches. Nothing is shared, so nothing is locked.
 
-### Frame buffer locking
+**Pass B — fill, partitioned by ROW BAND.** A band is 16 consecutive screen rows.
+Bands are claimed with an atomic cursor, so **one thread owns a band outright**.
+Every pixel therefore has exactly one writer for the whole frame.
 
-Work is handed out **by triangle**, so two threads routinely reach the same
-pixel, and the depth test there is a read-modify-write:
+Chunking is what makes this fit in memory: a setup record is ~128 bytes and the
+near clip can double the count, so a 2M-triangle model's setup array would be
+hundreds of MB. 32768 triangles is ~8 MB, reused for every chunk.
+
+### Why the frame buffer needs no locks any more
+
+There used to be 256 cache-line-padded spinlocks here, because work was handed
+out by triangle only, and two threads therefore landed on the same pixel
+routinely — and the depth test is a read-modify-write:
 
 ```c
 existing = frame_buffer[y][x];   if(closer) frame_buffer[y][x] = pixel;
 ```
 
-Unsynchronised that loses updates -- both threads read the same `existing`, both
-conclude they are in front, and the second write clobbers the first -- and it
-tears, because a `PixelCord` is 40 bytes and no store that wide is atomic.
+Unsynchronised that loses updates and tears a 40-byte `PixelCord` across two
+writers. Locking fixed the corruption but cost **28% of profiled frame time**,
+and it could not fix the other half of the problem: which of two fragments at
+*exactly* the same depth wins was still decided by arrival order, so ~1000 pixels
+changed between two renders of an identical frame.
 
-A lock per pixel is impossible (1.5M of them) and one lock for the buffer would
-remove the point of threading. The unit used is a **row band**: the scanline pass
-writes one row at a time, so a whole triangle-row is a single acquire, and two
-threads only wait on each other when their rows collide modulo the band count.
+Partitioning the fill by band solves both at once:
 
-- 256 bands, indexed `row & 255`, each padded to its own cache line. Packed
-  together, locking two different bands would still bounce one line between cores
-  and reintroduce most of the contention the banding exists to avoid.
-- Spinlocks, not mutexes: the critical section is one row of one triangle, so
-  waiting is cheaper than a round trip into the kernel, and there is never more
-  than one thread per core to be descheduled while holding one.
-- Taken after the row's gather and sort, which touch only thread-local memory.
-- A row outside the screen is never locked; nothing can be stored there.
+- **No lock.** One writer per pixel, so there is nothing to serialise.
+- **Bit-exact reproducibility.** Thread `t`'s setup slice sits entirely below
+  thread `t+1`'s, so walking a band's bins in thread order visits triangles in
+  increasing source order. A depth tie now resolves the same way every run, on
+  any number of cores — no tie-break comparison needed.
 
-Measured: torn writes go from 210 over six frames to **0**, and depth becomes
-identical on every pixel of every run. The cost is 11-21% of frame time
-(`dae_-_eco_house` 54.6 -> 66.3 ms, `woman_seated_v12` 28.2 -> 31.4 ms,
-`corrupted_archangel` 361.9 -> 414.1 ms), which is the price of roughly half a
-million uncontended atomics per frame.
+Measured across all 25 models in `3dmodels/`: two renders of the same frame are
+**identical on every one of 307,200 pixels**, where the locked version differed
+on up to 0.05% of them.
 
-The point-cloud path in `render()` takes no lock: it runs on the calling thread
-and finishes before any worker is spawned.
+The point-cloud path still runs on the calling thread, before any worker exists.
 
-What locking does *not* fix is which of two fragments at exactly the same depth
-wins -- that is a tie the depth test resolves by arrival order (`issues.md` 1).
+### What is shared, and how it is published
+
+- The camera snapshot (`rasterization_frame_begin`) and the view basis
+  (`view_refresh`) are written before any thread starts and only read after.
+- The setup array and the bins are written in pass A and read in pass B, ordered
+  by the barrier between them.
+- `bin_push` can fail to grow under memory pressure; it drops that triangle
+  rather than aborting the frame.
+
+---
 
 ## 5. Core types
 
 **`Vectex`** — world-space position (`x`,`y`,`z`), a texture coordinate (`u`,`v`), and a 32-bit colour. The input format.
 
-`u` and `v` are the drawn colour; `colour` is not (`issues.md` §8). Both must lie in `[0,1)` — the rasterizer turns them into array subscripts with no bounds check, so `1.0` is one texel past the end. `mesh.h` makes that part of the load contract.
+`u` and `v` are the drawn colour; `colour` is not (`issues.md` §3). The loaders still hold them in `[0,1)` as a load contract (`mesh.h`), but the rasterizer no longer *depends* on that: it clamps at the sample site (§8).
 
-**`PixelCord`** — screen-space position (`px`,`py`), the world-space depth `z` it came from, its texture coordinate, its resolved colour, and two flags. Serves three roles: a projected vertex, one step along a Bresenham strip, and a frame-buffer cell.
+**`PixelCord`** — screen-space position (`px`,`py`), the world-space depth `z` it came from, its texture coordinate, its resolved colour, and two flags. Now serves one role: a frame-buffer cell. The rasterizer's own projected vertices live in a leaner `SetupTri` instead.
 
 - `.in_use` — this cell has been written by `render()`. Doubles as the z-buffer occupancy bit: an unused cell always loses the depth test.
 - `.is_visible` — passed the frustum / screen-bounds test. Cells failing it are never stored.
 
 **`Object`** — `vertices[]` plus a flat `connectors_sequence[]` of indices into it, read three at a time, plus one texture (`texture`, `texture_width`, `texture_height`) shared by every vertex. `len_of_connectors == 0` means point cloud.
 
-`texture` is dereferenced unconditionally by both draw paths, so it is never allowed to be NULL: an object with no image gets a 1x1 texture of its flat colour instead. One texture per object is also the whole multi-material limitation (`issues.md` §10).
+`texture` is dereferenced unconditionally by both draw paths, so it is never allowed to be NULL: an object with no image gets a 1x1 texture of its flat colour instead. One texture per object is also the whole multi-material limitation (`issues.md` §5).
 
-**`Camera`** — axis-aligned frustum: position `(x,y,z)`, far-plane extents `(x_end,y_end,z_end)`, and lens fields `focal_l`, `v_fov`, `h_fov`. No rotation (`issues.md` §4).
+**`Camera`** — axis-aligned frustum: position `(x,y,z)`, far-plane extents `(x_end,y_end,z_end)`, lens fields `focal_l`, `v_fov`, `h_fov`, and orientation `yaw`/`pitch` (§6). What it still lacks is a *model*-side transform (`issues.md` §1).
 
 ---
 
@@ -158,7 +187,7 @@ h_fov   = 2 * atan(screen_width / (2 * focal_l)) // 81.79° at 1500x1000
 
 That is why the point-cloud path writes `frame_buffer[py][px]` without a bounds check — visibility is decided in world space, before projecting, and the two calculations cannot disagree. Verified against vertices at `z = -50` (behind the lens, frustum interval inverts and rejects), `z = 0` (interval collapses to empty) and `z = 0.001` (interval is a fraction of a world unit wide): all culled, nothing out of range.
 
-The invariant is not asserted anywhere, so it is a real constraint on both functions: changing the projection formula without matching `is_vectex_visible` reintroduces out-of-bounds writes. The triangle path does not depend on it — Bresenham re-gates every pixel and the span fill clamps to the screen before writing.
+The invariant is not asserted anywhere, so it is a real constraint on both functions: changing the projection formula without matching `is_vectex_visible` reintroduces out-of-bounds writes. Only the point-cloud path depends on it now — the triangle path clamps every span to the screen before writing, and rejects on the projected bounding box rather than on vertex visibility (§8).
 
 ### Near plane
 
@@ -184,7 +213,7 @@ The clip bounds magnification at `focal_l / margin` and guarantees a positive di
 
 Roughly half the triangles of a closed mesh point away from the eye. They were
 always discarded eventually -- by the depth test -- but only after paying for a
-clip, three projections, three Bresenham walks and a full scanline fill.
+clip, three projections and a full scanline fill.
 
 The test is the sign of `N . (a - eye)`, where `N = (b-a) x (c-a)` is the plane
 normal: it says which side of the triangle's plane the eye is on, which is the
@@ -196,7 +225,7 @@ Two things about where it sits:
 within its own plane, so every piece it produces has the same normal and the
 same facing as the whole. One test on the source triangle covers all of them --
 and it sidesteps the fact that `clip_triangle_near` does not preserve winding
-(`issues.md` 5).
+(`issues.md` §2).
 
 **Gated on `Object.double_sided`.** glTF marks materials `doubleSided`, and a
 material that says so must not be culled -- foliage cards and single-sided walls
@@ -205,7 +234,7 @@ concept, so they are treated as double sided: "we cannot tell" has to mean "do
 not throw geometry away".
 
 `set_backface_cull_forced(true)` overrides the flag for the cases where an
-exporter set it by default on a mesh that does not need it. `issues.md` 11 has
+exporter set it by default on a mesh that does not need it. `issues.md` §4 has
 the measured cost per model.
 
 ---
@@ -269,17 +298,71 @@ the floor.
 
 ## 8. Scanline fill
 
-Per triangle, after clipping and projecting:
+Per setup triangle, restricted to the rows of the band being filled:
 
-1. Bresenham each of the 3 edges into its own heap strip, one `PixelCord` per step carrying interpolated z and `u`/`v`.
-2. Walk rows from `min_y` to `max_y`, clamped to the screen.
-3. Gather each row's pixels using **one cursor per edge**. Bresenham strips are monotonic in `py`, so a cursor only ever advances — no rescanning. The cursor direction is chosen once per edge from whether the strip ascends or descends.
-4. Sort the row's pixels by `px` (insertion sort; rows are short).
-5. Fill between every consecutive pair, so a row ends up painted from its leftmost edge pixel to its rightmost.
+1. The three projected vertices arrive already **sorted by y**, so edge 0→2 is
+   the long one and 0→1, 1→2 are the two short ones.
+2. For each row, find where the long edge crosses it and where whichever short
+   edge covers that row crosses it. Those two crossings are the span.
+3. Fill from the left crossing to the right, clamped to the screen.
 
-The row table is sized from the **summed edge lengths**, not the bounding-box width: a near-horizontal edge can deposit an entire strip onto one row, so bbox width is not an upper bound on a row's occupancy.
+There is **no allocation, no per-edge pixel strip, no gather and no sort**. The
+previous form Bresenham-walked each of the three edges into its own `calloc`'d
+strip, gathered each row's pixels with a cursor per edge, insertion-sorted them
+by `px`, and filled between consecutive pairs — four heap allocations per
+triangle, which at 1.96M triangles is ~8M `calloc`/`free` per frame. Worse, a
+triangle clipped near the camera could project to a strip of ~250,000 `PixelCord`
+(9 MB) per edge.
 
-Colour is resolved last, per pixel: the span lerp carries `u`/`v`, and `texture[(size_t)(h*v)][(size_t)(w*u)]` is read at the write site. Interpolation across the span is linear in screen space, which is not perspective-correct (`issues.md` §6) and shows up more sharply on a texture than it did on a colour gradient.
+### Interpolation is perspective correct, and costs one divide per pixel
+
+The three quantities carried across a span are `u/w`, `v/w` and `1/w`, where
+`w = z − camera.z` is true depth in front of the eye. Those are the things that
+are **linear in screen space**; `u`, `v` and `z` are not. They are stepped
+incrementally along the row (one divide per row to form the step, none per
+pixel), and unprojected at the sample site:
+
+```c
+w = 1.0/iw;          // the one divide per pixel
+z = camera.z + w;    // exact depth
+u = uw * w;          // exact texture coordinate
+v = vw * w;
+```
+
+One divide buys correct depth *and* correct texture coordinates together. The old
+span fill paid three divides per pixel (`interpolate()` on z, u and v) for
+screen-space-linear values that were subtly wrong. The near clip guarantees
+`w >= 1`, so `1/w` is finite and positive.
+
+### The sample site holds its own bounds
+
+```c
+int64_t f_row=(int64_t)(vv*(double)th);      // SIGNED, deliberately
+if(f_row<0)f_row=0; else if(f_row>=(int64_t)th)f_row=(int64_t)th-1;
+```
+
+The cast is to a signed type on purpose: a negative `v` cast straight to `size_t`
+is an enormous subscript, and no clamp afterwards can undo that. The renderer now
+holds this invariant itself rather than trusting every producer of an `Object`.
+
+A texel with alpha < 128 is **skipped entirely** — not painted and not
+depth-written. That is what an alpha-cutout material wants; without it a
+transparent texel wins the depth test and punches a hole through the geometry
+behind it. 37.7% of `dae_-_eco_house`'s atlas is fully transparent, and its trees
+rendered as pale ghosts until this landed.
+
+### Culling
+
+- **Back face**, before the clip: `sign(N · (a − eye))`. Clipping only cuts a
+  triangle up within its own plane, so every piece has the same facing as the
+  whole and one test covers all of them.
+- **Screen bounding box**, after projection. This replaced a test that asked
+  whether any of the three *vertices* was inside the camera's frustum box — which
+  is wrong for any triangle bigger than the screen, because all three of its
+  corners are outside one. That silently deleted walls and floors whenever the
+  camera moved inside a room.
+- **Far plane**: a triangle wholly beyond `z_end` is dropped, and per pixel the
+  depth is range-checked before it is stored.
 
 ---
 
@@ -409,21 +492,73 @@ A texture path read out of a model file is resolved against that file's own dire
 
 ## 10. Deliberate omissions (see `issues.md`)
 
-- No matrix pipeline → no camera rotation, no per-object transform.
-- No perspective-correct interpolation.
-- No wireframe rendering. Dropped deliberately when rasterization moved to `rasterization.c`; the Bresenham walker remains as a triangle-edge utility.
-- No explicit primitive tag on `Object` — dispatch infers it from connector count, and nothing records indices-per-primitive.
-- No texture filtering. Sampling is nearest-neighbour at the texel the truncated `u`/`v` lands on; no bilinear, no mipmaps, so a minified texture aliases.
-- No texture wrap or clamp at the sample site — the `[0,1)` invariant is held by the loaders (`issues.md` §7).
-- One texture per `Object`. Multi-material files are split into several Objects (`mesh_load_scene`) rather than the renderer growing multi-texture support.
-- No alpha. The decoders keep the channel and the frame buffer carries it, but nothing tests it, so a cutout texture paints as a solid card (`issues.md` §10).
+- No matrix pipeline on the model side → no per-object transform. The view side
+  exists (`transform.c`).
+- No wireframe rendering. Dropped deliberately when rasterization moved to
+  `rasterization.c`; `bresenhame_line_algo` is now called by nothing.
+- No explicit primitive tag on `Object` — dispatch infers it from connector
+  count, and nothing records indices-per-primitive.
+- No texture filtering. Sampling is nearest-neighbour at the texel the truncated
+  `u`/`v` lands on; no bilinear, no mipmaps, so a minified texture aliases.
+- No sampler wrap modes: every texture is wrapped as REPEAT at load time
+  (`issues.md` §9).
+- One texture per `Object`. Multi-material glTF files are split into several
+  Objects; multi-material OBJ files are **not** (`issues.md` §5).
+- **Alpha is a cutout, not a blend.** A texel below alpha 128 is skipped; one
+  above it is written fully opaque into the frame buffer and composited against
+  the background once, in `win_upload_frame`. True alpha blending needs the
+  triangles sorted back to front, which a z-buffer-only pipeline has no
+  machinery for.
 - No lighting, so glTF `NORMAL` and OBJ `vn` are parsed past rather than stored.
+  This is why `KHR_materials_*` extensions can be ignored wholesale: there is no
+  shading model for them to change.
+- No skinning. Skinned glTF meshes render their bind pose (`issues.md` §7).
 
 ---
 
-## 11. Open design questions
+## 11. Model browser (`src/ui.c`)
+
+An overlay drawn **onto the SDL renderer**, after the scene texture and before
+the flip — never into the `PixelCord` buffer. That is the whole point: a frame
+costs tens of milliseconds and a keystroke should not.
+
+- `update_win` is split into `win_upload_frame` (flatten the grid into the
+  streaming texture) and `win_present` (blit that texture, draw the overlay,
+  flip). Moving the selection re-presents; only a camera change re-rasterizes.
+- Text is `SDL_RenderDebugText`, SDL3's built-in 8×8 font — no SDL_ttf, no font
+  file, no new dependency. The file list is `SDL_EnumerateDirectory`, sorted,
+  because enumeration order is the filesystem's rather than alphabetical.
+- `L` or `F1` toggles it. While open it takes **first refusal on every event**,
+  so the arrow keys move the selection instead of the camera.
+- `ui.c` owns the loaded `Model`, because the swap has to free the old one at
+  exactly one moment relative to `set_objects()`:
+
+  ```
+  1. set_objects(fresh.objects, fresh.len)   // the renderer reads the new array
+  2. mesh_model_free(&current)               // only now release the old one
+  3. current = fresh                         // take ownership
+  ```
+
+  Reversing 1 and 2 is a use-after-free the moment `render()` stops joining its
+  workers before returning. It does today; nothing should rely on that.
+- A failed import needs no cleanup — `mesh_import` promises a zeroed `Model` on
+  error — and leaves the previous model installed and on screen.
+- A load blocks for seconds, so the "Loading…" notice is latched and presented
+  *before* `mesh_import` is called, and the mouse queue is flushed afterwards so
+  seconds of buffered motion do not fling the camera.
+- `camera_reset()` runs on every successful swap. Every model is fitted into the
+  same box, so a camera left somewhere else would show a blank screen and read
+  as a failed load.
+
+---
+
+## 12. Open design questions
 
 <!-- your notes here. -->
 <!-- - should Object gain an explicit `kind` tag instead of connector-count dispatch? -->
-<!-- - when the view matrix lands, does `Camera` become a matrix or keep the frustum box for culling? -->
-<!-- - partition rasterization by triangle (current, races on shared pixels) or by screen row/tile (no shared pixels, but every thread clips and projects every triangle)? -->
+<!-- - when the model matrix lands, does `Camera` become a matrix or keep the frustum box for culling? -->
+<!-- - PixelCord is 40 bytes and the whole grid is memset every frame (60MB at 1500x1000).
+       update_win reads only .in_use and .colour; the depth test reads only .z and .in_use.
+       Would a split colour plane + depth plane be worth the churn? -->
+<!-- - band height is 16 rows. Smaller = better load balance, more bin entries per triangle.
+       Has not been swept. -->
