@@ -20,6 +20,7 @@ add_executable(renderer
     src/mesh_obj.c
     src/mesh_gltf.c
     src/json.c
+    src/image.c
     src/png.c
     src/jpeg.c
     src/inflate.c
