@@ -35,6 +35,10 @@ void ui_shutdown(void);
 bool ui_is_open(void);
 void ui_close(void);
 
+// True exactly once per open, so the caller can end an in-flight camera drag
+// without issuing an SDL_CaptureMouse call on every event the panel consumes.
+bool ui_just_opened(void);
+
 // First refusal on every event. Returns true when it consumed the event, in
 // which case the caller must not also act on it -- that is what stops an arrow
 // key from both moving the list selection and turning the camera.

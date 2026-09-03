@@ -68,9 +68,12 @@ if(win==NULL){
             // camera and cost a whole frame.
             if(ui_handle_event(&event)){
                 needs_present=true;
-                // if the panel opened mid-drag it also swallowed the button-up,
-                // so the drag has to be ended here or the camera spins forever
-                if(ui_is_open()){ is_dragging=false; SDL_CaptureMouse(false); }
+                // If the panel opened mid-drag it also swallowed the button-up,
+                // so the drag has to be ended or the camera spins forever. Once
+                // per open, not once per consumed event: doing it on every event
+                // is an SDL_CaptureMouse call per mouse motion, hundreds a
+                // second, in the very path this split exists to keep cheap.
+                if(ui_just_opened()){ is_dragging=false; SDL_CaptureMouse(false); }
                 continue;
             }
 
@@ -79,6 +82,11 @@ if(win==NULL){
             case SDL_EVENT_WINDOW_CLOSE_REQUESTED:
                 is_proc_running=false;
                 printf("Window close requested\n");
+                break;
+            case SDL_EVENT_WINDOW_EXPOSED:
+                // an occluded window that comes back needs the last frame put
+                // on the glass again -- not rasterized again
+                needs_present=true;
                 break;
             case SDL_EVENT_WINDOW_RESIZED:
             case SDL_EVENT_WINDOW_MAXIMIZED:
@@ -272,6 +280,12 @@ return true;
 void win_upload_frame(const PixelCord* frame_buffer){
 int w,h;
 if(!ensure_targets(&w,&h))return;
+
+// The grid is sized by the last renderer_resize(), not by the window's size
+// right now, and between a resize event and the render() that follows it those
+// disagree. Read the renderer's own dimensions so this can never walk off the
+// end of the buffer it was handed.
+if((uint32_t)w!=screen_width||(uint32_t)h!=screen_hieght)return;
 
 if(pixel_buffer==NULL || pb_w!=w || pb_h!=h){
     free(pixel_buffer);

@@ -143,6 +143,11 @@ for(;;){
     // (obj spec, general statement syntax). exporters use it to wrap long v and
     // f lines, so treating it as a terminator rejects conformant files. count
     // the run so an escaped backslash is not mistaken for a continuation.
+    //
+    // A '#' anywhere on the line ends it first, though. Comments are stripped by
+    // the callers, which run after this -- so without this check a comment that
+    // happens to end in '\' silently eats the statement on the next line.
+    if(memchr(r->line,'#',r->line_len))return 1;
     size_t bs=r->line_len;
     while(bs>0&&r->line[bs-1]=='\\')bs--;
     if((r->line_len-bs)%2==1){
@@ -508,8 +513,11 @@ for(;;){
         while(*q){
             const char* e=skip_token(q);
             char* name=dup_str(q,(size_t)(e-q));
-            char* full=name?mesh_path_sibling(path,name):NULL;
+            // same fallback map_Kd gets: exporters write absolute mtllib paths
+            // too, and dropping the library loses every material at once
+            char* full=name?mesh_texture_sibling(path,name):NULL;
             if(full)load_mtl(full,&mats);
+            else if(name)printf("mesh: %s: mtllib '%s' not found\n",path,name);
             free(full);
             free(name);
             q=skip_ws(e);

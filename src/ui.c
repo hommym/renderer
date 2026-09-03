@@ -38,6 +38,7 @@ static bool     busy=false;          // a load is latched and about to block
 static int      sel=0;               // highlighted row
 static int      first=0;             // first visible row
 static int      pending=-1;          // entry index the user asked for, or -1
+static bool     just_opened=false;   // consumed once by the event loop
 static char     loading_name[128]="";
 static char     status[192]="";
 
@@ -125,6 +126,7 @@ void ui_shutdown(void){
 
 bool ui_is_open(void){ return open_; }
 void ui_close(void){ open_=false; }
+bool ui_just_opened(void){ bool j=just_opened; just_opened=false; return j; }
 bool ui_load_pending(void){ return pending>=0; }
 
 void ui_begin_load(void){
@@ -200,11 +202,21 @@ static void scroll_into_view(int win_w,int win_h){
     if(first<0)first=0;
 }
 
-// window pixels -> UI units. The one place the scale is undone: SDL_SetRenderScale
-// scales what is drawn but NOT the coordinates SDL puts in a mouse event.
+// Mouse coordinates -> UI units, and there are TWO conversions here, not one.
+//
+// SDL reports a mouse event in WINDOW coordinates, but everything drawn goes
+// through the renderer, whose output is measured in PIXELS -- and on a HiDPI
+// display those are not the same number. SDL_RenderCoordinatesFromWindow is the
+// mapping between them; skipping it puts the hit-test half a panel away from the
+// highlight on exactly the displays where it is hardest to notice in a
+// screenshot. Then SDL_SetRenderScale is undone on top of that: it scales what
+// is drawn but not what SDL reports.
 static int row_at(int win_w,int win_h,float wx,float wy){
     SDL_FRect p=panel_rect(win_w,win_h);
-    float ux=wx/UI_SCALE, uy=wy/UI_SCALE;
+    float rx=wx,ry=wy;
+    SDL_Renderer* rend=win?SDL_GetRenderer(win):NULL;
+    if(rend)SDL_RenderCoordinatesFromWindow(rend,wx,wy,&rx,&ry);
+    float ux=rx/UI_SCALE, uy=ry/UI_SCALE;
     float top=p.y+UI_PAD+UI_HEADER_H;
     if(ux<p.x||ux>p.x+p.w||uy<top||uy>p.y+p.h)return -1;
     int i=first+(int)((uy-top)/UI_ROW_H);
@@ -214,12 +226,27 @@ static int row_at(int win_w,int win_h,float wx,float wy){
 
 // ---- events ----------------------------------------------------------------
 
+// Which events the panel is ever entitled to claim. Window events are NOT on the
+// list: swallowing SDL_EVENT_WINDOW_CLOSE_REQUESTED while a load is latched
+// would make the window unclosable for the several seconds an import takes.
+static bool is_input_event(const SDL_Event* e){
+    switch(e->type){
+    case SDL_EVENT_KEY_DOWN: case SDL_EVENT_KEY_UP:
+    case SDL_EVENT_MOUSE_BUTTON_DOWN: case SDL_EVENT_MOUSE_BUTTON_UP:
+    case SDL_EVENT_MOUSE_MOTION: case SDL_EVENT_MOUSE_WHEEL:
+        return true;
+    default:
+        return false;
+    }
+}
+
 bool ui_handle_event(const SDL_Event* e){
-    if(busy)return true;                       // swallow everything mid-load
+    if(!is_input_event(e))return false;        // resize and close always get through
+    if(busy)return true;                       // swallow input mid-load
 
     if(e->type==SDL_EVENT_KEY_DOWN&&(e->key.key==SDLK_L||e->key.key==SDLK_F1)){
         open_=!open_;
-        if(open_){ ui_rescan(); status[0]='\0'; }
+        if(open_){ ui_rescan(); status[0]='\0'; just_opened=true; }
         return true;
     }
     if(!open_)return false;                    // closed: everything falls through
@@ -262,9 +289,10 @@ bool ui_handle_event(const SDL_Event* e){
     case SDL_EVENT_MOUSE_BUTTON_DOWN:{
         int i=row_at(w,h,e->button.x,e->button.y);
         if(i>=0){
-            // a click selects; a second click on the same row loads it
-            if(i==sel)pending=i;
             sel=i;
+            // a single click only selects. loading blocks for up to five
+            // seconds, so it needs a deliberate gesture: double click, or Enter.
+            if(e->button.clicks>=2)pending=i;
         }
         return true;    // never let a click through to the camera drag
     }

@@ -66,6 +66,7 @@ typedef struct Bucket {
     size_t   img;   bool   has_img;
     bool     double_sided;
     uint32_t flat;                       // baseColorFactor, for when the image is unusable
+    bool     has_flat;                   // a factor of 0x00000000 is a value, not an absence
 } Bucket;
 
 typedef struct Ctx {
@@ -517,7 +518,12 @@ static bool image_load(Ctx* c,size_t ii,Image* img){
         const uint8_t* d;
         size_t n;
         if(view_bytes(c,vi,&d,&n)!=MESH_OK)return false;
-        return image_decode(d,n,MESH_TEXTURE_MAX_DIM,img,NULL,0);
+        {
+            char err[128]={0};
+            if(image_decode(d,n,MESH_TEXTURE_MAX_DIM,img,err,sizeof err))return true;
+            printf("mesh: image %zu (data uri): %s\n",ii,err[0]?err:"decode failed");
+            return false;
+        }
     }
 
     const char* uri=json_member_string(iv,"uri",NULL);
@@ -530,7 +536,9 @@ static bool image_load(Ctx* c,size_t ii,Image* img){
         uint8_t* raw=NULL;
         size_t rn=0;
         if(!b64_decode(comma+1,strlen(comma+1),&raw,&rn))return false;
-        bool ok=image_decode(raw,rn,MESH_TEXTURE_MAX_DIM,img,NULL,0);
+        char err[128]={0};
+        bool ok=image_decode(raw,rn,MESH_TEXTURE_MAX_DIM,img,err,sizeof err);
+        if(!ok)printf("mesh: image %zu (embedded): %s\n",ii,err[0]?err:"decode failed");
         free(raw);
         return ok;
     }
@@ -545,7 +553,9 @@ static bool image_load(Ctx* c,size_t ii,Image* img){
     memcpy(full,c->dir,c->dir_len);
     memcpy(full+c->dir_len,dec,nlen+1);
     free(dec);
-    bool ok=image_decode_file(full,MESH_TEXTURE_MAX_DIM,img,NULL,0);
+    char err[128]={0};
+    bool ok=image_decode_file(full,MESH_TEXTURE_MAX_DIM,img,err,sizeof err);
+    if(!ok)printf("mesh: image %zu ('%s'): %s\n",ii,full,err[0]?err:"decode failed");
     free(full);
     return ok;
 }
@@ -650,7 +660,9 @@ static MeshResult build_scene(Ctx* c,Model* out){
             // no image, or one we could not decode: the material's flat base
             // colour, so this object still has something to sample
             Image im={0};
-            if(!image_solid(b->flat?b->flat:MESH_DEFAULT_COLOUR,&im)){r=MESH_ERR_OOM;break;}
+            // a material really can ask for transparent black; only an
+            // ABSENT factor falls back to the default grey
+            if(!image_solid(b->has_flat?b->flat:MESH_DEFAULT_COLOUR,&im)){r=MESH_ERR_OOM;break;}
             px=im.pixels;w=im.width;h=im.height;
             texs[ntex++]=px;
         }
@@ -841,7 +853,7 @@ static MeshResult emit_primitive(Ctx* c,const JsonValue* prim,const double m[16]
     Bucket* bk=&c->buckets[mat];
     if(has_img&&img<c->nimages){ bk->img=img; bk->has_img=true; }
     if(two_sided)bk->double_sided=true;
-    if(flat)bk->flat=flat;
+    bk->flat=flat; bk->has_flat=true;
 
     size_t base=bk->nverts,vneed,ineed;
     if(!sz_add(base,pos.count,&vneed))return MESH_ERR_FORMAT;
@@ -1122,7 +1134,14 @@ static MeshResult load_gltf_scene(const char* path,Model* out){
         for(size_t i=0;i<nreq;i++){
             const JsonValue* e=json_at(req,i);
             if(json_type(e)!=JSON_STRING){json_free(doc);free(file);return MESH_ERR_FORMAT;}
-            if(!ext_is_ignorable(json_string(e,NULL))){json_free(doc);free(file);return MESH_ERR_UNSUPPORTED;}
+            const char* nm=json_string(e,NULL);
+            if(!ext_is_ignorable(nm)){
+                // the bare "unsupported format or feature" is what made working
+                // out why six models would not load a research exercise
+                printf("mesh: %s requires extension '%s', which this loader does not implement\n",
+                       path,nm?nm:"(unnamed)");
+                json_free(doc);free(file);return MESH_ERR_UNSUPPORTED;
+            }
         }
     }
 

@@ -115,10 +115,26 @@ existing = frame_buffer[y][x];   if(closer) frame_buffer[y][x] = pixel;
 ```
 
 Unsynchronised that loses updates and tears a 40-byte `PixelCord` across two
-writers. Locking fixed the corruption but cost **28% of profiled frame time**,
-and it could not fix the other half of the problem: which of two fragments at
-*exactly* the same depth wins was still decided by arrival order, so ~1000 pixels
-changed between two renders of an identical frame.
+writers. Locking fixed the corruption but was expensive, and it could not fix
+the other half of the problem: which of two fragments at *exactly* the same
+depth wins was still decided by arrival order, so ~1000 pixels changed between
+two renders of an identical frame.
+
+How expensive is worth stating carefully, because the two obvious ways to
+measure it disagree and both get quoted. `gprof` attributed 28% of the profiled
+main thread to `frame_row_lock` — but a sampling profile of one thread charges
+that thread for time it spends *waiting* on the others, so it overstates. The
+honest number is an A/B of the same rasterizer with the locks compiled out:
+
+| model | with locks | without | saved |
+| --- | --- | --- | --- |
+| `woman_seated_v12` | 13.2 ms | 7.8 ms | 41% |
+| `dae_-_eco_house` | 32.0 ms | 21.9 ms | 32% |
+| `interior_8_bedroom` | 12.5 ms | 10.1 ms | 19% |
+
+Total *CPU work* saved is smaller (~12%): most of what the locks cost was
+contention, not instructions, so it shows up in wall clock rather than in a
+single-threaded run.
 
 Partitioning the fill by band solves both at once:
 
@@ -133,6 +149,32 @@ Measured across all 25 models in `3dmodels/`: two renders of the same frame are
 on up to 0.05% of them.
 
 The point-cloud path still runs on the calling thread, before any worker exists.
+
+### What the whole change is worth
+
+End to end, against the previous design as it was actually shipped (`-g`, no
+optimisation) — 900x700, minimum of four runs, quiet machine:
+
+| model | tris | before | after | |
+| --- | --- | --- | --- | --- |
+| `mona_low_poly` | 5k | 7.0 ms | 2.5 ms | 2.8x |
+| `low_poly_street` | 2k | 9.4 ms | 3.0 ms | 3.1x |
+| `hand_painted_forest` | 51k | 24.2 ms | 7.9 ms | 3.1x |
+| `interior_8_bedroom` | 17k | 66.9 ms | 7.6 ms | 8.8x |
+| `woman_seated_v12` | 95k | 50.0 ms | 10.0 ms | 5.0x |
+| `dae_-_eco_house` | 124k | 92.3 ms | 20.7 ms | 4.5x |
+| `kralzfiller` | 333k | 212.9 ms | 30.4 ms | 7.0x |
+| `zfwkq` | 433k | 210.6 ms | 30.9 ms | 6.8x |
+| `poly` | 843k | 214.9 ms | 43.6 ms | 4.9x |
+| `model` | 845k | 323.5 ms | 44.2 ms | 7.3x |
+| `shareModel.obj` | 1.0M | 353.7 ms | 85.4 ms | 4.1x |
+| `TombRaider` | 1.98M | 403.0 ms | 68.5 ms | 5.9x |
+| `corrupted_archangel` | 1.96M | 858.6 ms | 119.8 ms | 7.2x |
+
+Roughly half of that is the build flags (§1 note) and the rest is this rewrite.
+Beware benchmarking any of it on a loaded machine: the same binary measured
+27 ms and 41 ms for the same frame under load average 12, which is wider than
+most of the differences anyone would want to attribute.
 
 ### What is shared, and how it is published
 
@@ -562,3 +604,8 @@ costs tens of milliseconds and a keystroke should not.
        Would a split colour plane + depth plane be worth the churn? -->
 <!-- - band height is 16 rows. Smaller = better load balance, more bin entries per triangle.
        Has not been swept. -->
+<!-- - the chunk loop is per OBJECT, so barriers scale with object count as well as
+       triangle count: a 61-material model pays 61 x 3 barriers minimum. Making the
+       chunk stream global across objects (storing the object on each SetupTri) would
+       make it depend only on total triangles. Measured as ~3% on kralzfiller, so it
+       has not been done. -->
