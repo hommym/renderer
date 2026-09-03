@@ -8,7 +8,7 @@ Open problems in the renderer. Each entry: what breaks, why it breaks, fix direc
 
 **What breaks.** The same scene renders differently every run. Some pixels end up holding a combination of values that no triangle ever produced.
 
-**Why.** `rasterization.c:282-285` (span fill) and `rasterization.c:294-297` (edge pixel) both do an unsynchronised read-modify-write:
+**Why.** `rasterization.c:289-294` (span fill) and `rasterization.c:303-308` (edge pixel) both do an unsynchronised read-modify-write:
 
 ```c
 PixelCord existing = frame_buffer[y][x];              // 1. read
@@ -33,7 +33,7 @@ The cube hides this because 12 triangles barely contend for the same pixel; a re
 
 **What breaks.** Undefined behaviour on every worker exit.
 
-**Why.** `rasterization.c:309` declares `void* rasterization_worker(void* args)` and the function body ends after the `while` loop with no `return`. Reaching the closing brace of a non-`void` function and having the caller use the value is UB. `pthread_join` is passed `NULL` for the result today, so nothing reads it and it does not misbehave in practice.
+**Why.** `rasterization.c:321` declares `void* rasterization_worker(void* args)` and the function body ends after the `while` loop with no `return`. Reaching the closing brace of a non-`void` function and having the caller use the value is UB. `pthread_join` is passed `NULL` for the result today, so nothing reads it and it does not misbehave in practice.
 
 **Fix path.** `return NULL;` at the end. `args` is also unused (`-Wunused-parameter`) — cast it to void or use it, since the worker index is currently passed and discarded.
 
@@ -69,13 +69,24 @@ The cube hides this because 12 triangles barely contend for the same pixel; a re
 
 ---
 
-## 6. Depth and colour interpolation is not perspective-correct
+## 6. Depth and texture-coordinate interpolation is not perspective-correct
 
-**What breaks.** Depth arbitration and the per-pixel colour lerp both interpolate linearly in *screen* space. Under perspective projection that is close but wrong — foreshortening biases the true value toward the farther endpoint. Visible as a faint seam along the diagonal where the two triangles of a quad meet, on any face with a strong colour gradient.
+**What breaks.** Depth arbitration and the per-pixel `u`/`v` lerp both interpolate linearly in *screen* space. Under perspective projection that is close but wrong — foreshortening biases the true value toward the farther endpoint. Visible as a faint seam along the diagonal where the two triangles of a quad meet, on any face with a strong colour gradient.
 
 Note this applies only to the raster-time lerp. `lerp_vectex` in the near clip interpolates in world space along a straight 3D edge, which is exact and unaffected.
 
-**Fix path.** Interpolate `1/z` linearly in screen space and invert per pixel; interpolate `colour/z` the same way. The same machinery gives perspective-correct texture coordinates later.
+**How much it currently costs.** Measured by computing both the affine and the perspective-correct sample for every span pixel in a frame and comparing:
+
+| model | span px | sampled a different texel | differed by >32 per channel |
+| --- | --- | --- | --- |
+| `hand_painted_forest.glb` | 710,002 | 49.9% | **0.0%** |
+| `woman_seated_v12.glb` | 45,647 | 0.2% | **0.0%** |
+| `shareModel.obj` | 12,178 | 0.1% | **0.0%** |
+| `model.glb` | 777 | 0.0% | **0.0%** |
+
+So it is real but currently invisible: half the pixels of the forest land on a *neighbouring* texel, none land somewhere visibly different. These models are dense, so a triangle covers few pixels and the affine error has no room to accumulate. It becomes visible the moment a single triangle spans a lot of screen and a lot of depth — a floor, a wall, a ground plane — which is exactly what a low-poly test scene is made of.
+
+**Fix path.** Store `u/w`, `v/w` and `1/w` in the `PixelCord` at projection time (`w = z - camera.z`), let Bresenham and the span fill interpolate those three linearly exactly as they already do, and divide at the sample site: `u = (u/w)/(1/w)`. No interpolation code changes — only what goes in and what comes out. It needs one new `PixelCord` field.
 
 ---
 
@@ -96,12 +107,64 @@ if(screen_hieght!=0 && screen_width!=0) create_frame_buffer(screen_width,screen_
 
 ---
 
-## 8. Texture-coloured models load flat
+## 8. The rasterizer indexes the texture with no bounds check
 
-**What breaks.** A model whose colour lives in a texture rather than in per-vertex data renders as one uniform grey (`MESH_DEFAULT_COLOUR`). The repo's tree GLB is exactly this case: its primitive carries `POSITION`, `NORMAL` and `TEXCOORD_0`, but no `COLOR_0`.
+**What breaks.** `rasterization.c:290-291` and `:305-306` compute
 
-**Why.** The renderer has no texture units — it interpolates colour between vertices — so the only way to carry a texture's appearance is to sample it per vertex at load time and bake the result into `Vectex.colour`. `tools/glb_to_header.py` did that with Pillow. Doing it in C needs a PNG decoder, which needs a zlib inflate implementation; both were out of scope for the loaders.
+```c
+size_t f_row=(size_t)(obj->texture_height*fill_pixel.v);
+size_t f_col=(size_t)(obj->texture_width *fill_pixel.u);
+fill_pixel.colour=texture[f_row][f_col];
+```
 
-`mesh_load_gltf` reads `COLOR_0` when present and otherwise falls back, which is correct but leaves textured models grey.
+with nothing between the multiply and the subscript. `v == 1.0` gives `row == texture_height`, one row past the end; a negative `v` converts to an enormous `size_t`. Both are out-of-bounds reads.
 
-**Fix path.** Either write an inflate + PNG decoder and sample `baseColorTexture` at each vertex's `TEXCOORD_0` (matching what the Python tool did), or read `materials[].pbrMetallicRoughness.baseColorFactor` as a flat per-primitive colour, which is a few lines and gets the model's average tone rather than its detail.
+**Why.** The bound is currently held up entirely by the loaders: `mesh.h` makes "every `u` and `v` is inside `[0,1)`" part of the load contract, `mesh_wrap_uv` enforces it per vertex, and `mesh.c`'s `validate()` re-checks every vertex before an Object is handed back. Linear interpolation between two in-range values stays in range, so the invariant survives the raster walk — *except* through the near-plane clip lerp, which is exactly how it can be broken.
+
+A hand-built `Object` (the cube in `main.c`) is not covered by any of that; its `u`/`v` are whatever the initialiser left.
+
+**Fix path.** Clamp at the sample site — `if(row>=h)row=h-1;` and the same for the column — so the renderer holds its own invariant instead of trusting every producer of an `Object`. Wrapping (`row%h`) is the other option and is what a REPEAT sampler does, but clamping is one comparison and cannot turn a small error into a jump across the image.
+
+---
+
+## 9. `Vectex.colour` is no longer drawn
+
+**What breaks.** A mesh whose colour lives per vertex and not in an image — PLY `red/green/blue`, glTF `COLOR_0`, the non-standard OBJ `v x y z r g b` — renders as one flat colour.
+
+**Why.** The rasterizer overwrites every pixel's colour with a texture sample (`rasterization.c:293`, `:307`) rather than using the interpolated `current.colour`. The loaders still fill `Vectex.colour`, and the flat fallback texture is built from it (PLY averages every vertex colour into its 1x1 texture), so the model gets its overall tone but none of its variation.
+
+There is no way to fix this in the loader: a texture lookup cannot reproduce per-vertex colour, because interpolating `u,v` across a triangle sweeps a rectangle of unrelated texels rather than blending three corner colours.
+
+**Fix path.** In the rasterizer, use the texture only when the object has a real one:
+
+```c
+fill_pixel.colour = (obj->texture_width>1 || obj->texture_height>1)
+    ? texture[f_row][f_col]
+    : interpolate_colour(current.colour,next.colour,span,fill_i);
+```
+
+or give `Object` an explicit flag rather than inferring from the 1x1 fallback.
+
+---
+
+## 10. Three of fourteen models are refused by the `extensionsRequired` gate
+
+**What breaks.** `citlali.glb`, `citlali/source/.../scene.gltf` and `a_salsa_dance.glb` load as `MESH_ERR_UNSUPPORTED`.
+
+**Why.** `mesh_load_gltf` refuses any non-empty `extensionsRequired` array. These three require `KHR_materials_pbrSpecularGlossiness`, which is a *material model* extension: it changes how the base colour is combined with metal/roughness, not how a vertex or an index is stored. The geometry and `TEXCOORD_0` are perfectly readable.
+
+The blanket refusal is right in principle — a required extension may change the meaning of the buffers (Draco does) — but it is too coarse to tell a geometry extension from a shading one.
+
+**Fix path.** Keep the refusal as the default and allow-list the extensions that provably do not touch geometry: `KHR_materials_pbrSpecularGlossiness`, `KHR_materials_unlit`, `KHR_texture_transform` (it only offsets/scales uv, so it is a wrong-mapping risk, not a wrong-geometry one), `KHR_materials_emissive_strength`.
+
+---
+
+## 11. Texture alpha is discarded
+
+**What breaks.** A texture's transparent regions paint as opaque colour. Anything authored as an alpha cutout — foliage, fences, grates, hair — renders as a solid card instead of a cut-out shape.
+
+**Why.** The decoders keep the alpha channel and `Object.texture` stores it in the top byte, but nothing reads it. `rasterization.c` writes the sampled word into the frame buffer whole, and `update_win` copies `.colour` straight into an `SDL_PIXELFORMAT_ARGB8888` texture whose blend mode is the default `SDL_BLENDMODE_NONE`, so the alpha byte is carried all the way to SDL and then ignored.
+
+Measured over the current model set, `dae_-_eco_house.glb` is the case that has it: **37.7%** of its dominant texture is fully transparent and another **13.2%** is partially transparent; 27.8% of its vertices sample a fully transparent texel. Every other model in the set is fully opaque, which is why this has not shown up as an obvious defect yet.
+
+**Fix path.** The cheap version is an alpha cutout: at the sample site, `if((texel>>24) < 128) continue;` — skip the pixel entirely so it is neither painted nor depth-written. That is what a cutout material wants and it costs one comparison. True alpha blending needs the triangles sorted back-to-front, which the current z-buffer-only pipeline has no machinery for.
