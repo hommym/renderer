@@ -13,6 +13,7 @@ Design notes for the renderer. Companion to `issues.md` — that file tracks wha
 | `src/wireframe.c` | `bresenhame_line_algo` — walks one segment, emits one `PixelCord` per step with interpolated z and texture coordinates |
 | `src/projection.c` | `perspective_projection` — one axis of the perspective divide |
 | `src/interpolation.c` | Scalar and per-channel colour lerps |
+| `src/transform.c` | Camera basis and the world-to-view step |
 | `src/utils.c` | `sort_pixelcords_by_px` (insertion sort), `get_number_of_cores` |
 | `src/win_i_o.c` | SDL window, event loop, frame-buffer → texture blit |
 | `src/mesh*.c`, `src/json.c` | Mesh file loading — see §9 |
@@ -137,6 +138,54 @@ It exists because the perspective divide degenerates at the lens: magnification 
 Surviving vertices are copied verbatim; new vertices are lerped along the original edges, so the output is a genuine sub-region of the source triangle — a cut, not a relocation. `lerp_vectex` solves for `t` from z alone, then applies that same `t` to x, y and colour. Any future per-vertex attribute rides the same `t`.
 
 The clip bounds magnification at `focal_l / margin` and guarantees a positive divisor, but it does **not** bound the projected coordinate — a vertex on the near plane far off-axis still projects tens of thousands of pixels away. Row and span clamping in the fill loop handle that separately.
+
+---
+
+### View transform
+
+The camera can turn, and **nothing downstream of the transform knows it can**.
+
+`projection.c`, `clip_triangle_near` and `is_vectex_visible` were all written
+against a camera that looks straight down +z out of an axis-aligned box. Rather
+than teach three separate pieces of code about rotation, every vertex is rotated
+into the camera's frame first (`src/transform.c`):
+
+```
+v' = eye + R^T * (v - eye)
+```
+
+Rotate about the eye, then put the result back at the eye. After that the
+camera's forward direction *is* +z and the geometry sits in exactly the
+situation the existing code already handles, so the perspective divide, the
+near-plane clip and the frustum cull are untouched. At zero rotation the whole
+function is the identity.
+
+Putting the result back at the eye (rather than moving the eye to the origin, as
+a textbook view matrix does) is what keeps `camera.z`, `x_end` and the rest of
+the box meaningful: `depth = z - camera.z` is still the distance along the view
+direction, and `x - x_center` is still the sideways offset.
+
+`R` is built from two angles, not stored as a matrix. `yaw` turns about the
+vertical, `pitch` about the horizontal, and the basis is
+
+| axis | vector | note |
+| --- | --- | --- |
+| right | `( cos y, 0, -sin y )` | yaw only, so strafing never drifts vertically |
+| down | `( sin y sin p, cos p, cos y sin p )` | `fwd x right`; +y is down, hence *down* not *up* |
+| forward | `( sin y cos p, -sin p, cos y cos p )` | `-sin p` because pitching up moves towards -y |
+
+Orthonormal, so `R^T` *is* `R^-1` and there is nothing to invert at runtime.
+Pitch is clamped to +/-89 degrees: at exactly vertical the horizontal heading is
+undefined and the view rolls through it.
+
+The basis is rebuilt once per frame by `view_refresh()` at the top of `render()`
+— the trigonometry is the expensive part and the camera does not move mid-frame.
+`view_apply()` is then nine multiplies. The rasterization threads only read it.
+
+`move_camera` uses the same basis: forward follows the gaze including pitch,
+left/right strafe along the horizontal `right` axis, and up/down deliberately
+stay on the world vertical so looking down and pressing up does not fly you into
+the floor.
 
 ---
 

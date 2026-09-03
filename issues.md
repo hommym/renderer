@@ -49,13 +49,24 @@ The cube hides this because 12 triangles barely contend for the same pixel; a re
 
 ---
 
-## 4. Camera rotation
+## 4. No per-object transform
 
-**What breaks.** There is no way to rotate the camera. `move_camera(unit, Movement)` handles translation only.
+**What breaks.** A model cannot be moved, turned or scaled independently of the
+camera. The only way to place one is to mutate its `vertices` array, which
+literally relocates it in the world -- so "rotate this object" and "rotate the
+camera the other way" are indistinguishable, and two objects cannot be posed
+differently from one another.
 
-**Why.** World points are consumed by the projection directly. There is no view matrix, no per-Object model matrix, no matrix pipeline at all. Rotating an Object today means mutating its `vertices` array in place — which literally moves the model in the world, so you cannot tell "Object rotated" apart from "camera rotated the other way relative to a stationary Object."
+**Why.** The camera now has an orientation (`yaw`/`pitch`) and every vertex is
+rotated into view space before projection, so the *view* side of a matrix
+pipeline exists. The model side does not: `Object` carries no transform, and
+`mesh_fit_to_view` places a model by rewriting every vertex once at load time.
 
-**Fix path.** Add a 4x4 transform matrix to `Object` (the model matrix) and one to `Camera` (the view matrix). Multiply each vertex by `view * model` before projection.
+**Fix path.** Give `Object` a 4x4 model matrix and multiply it into the same
+pass that already applies the view transform in `rasterizer()` -- one
+`model * view` composition per object per frame rather than per vertex. That
+also removes the need for `mesh_fit_to_view` to rewrite geometry, since the fit
+becomes a matrix like any other.
 
 ---
 
