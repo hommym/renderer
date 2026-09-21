@@ -15,7 +15,6 @@ offset=xy-centre;
 depth=z-z_start;
 
 if(depth != 0){
-    if(depth<1.0 && depth>=0.0)depth=1.0;
     offset = (offset * focal) / (depth);
 }
 
