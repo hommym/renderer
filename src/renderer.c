@@ -153,15 +153,16 @@ atomic_store(&triangle_tracker,0);
 
     //using main thread too in rasterization process
     rasterization_worker(NULL);
+    
     // 2. Join multiple threads in a separate loop
-    printf("Waiting for threads which are still working to finish to finish...\n");
+    // printf("Waiting for threads which are still working to finish to finish...\n");
     for (int i = 0; i < num_core && num_core>1; i++) {
         if (pthread_join(threads[i], NULL) != 0) {
             perror("Failed to join thread");
             return false;
         }
     }
-    printf("Rasterization Process Done\n");
+    
 
 
 }
