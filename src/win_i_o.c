@@ -15,6 +15,7 @@ static uint32_t* pixel_buffer=NULL;
 static int pb_w=0;
 static int pb_h=0;
 
+
 void get_window_size(int* w,int* h){
 if(win!=NULL){
 SDL_GetWindowSizeInPixels(win,w,h);
@@ -59,9 +60,9 @@ if(win==NULL){
                 }
                 update_win(get_frame_buffer());
                 break;
-            case SDL_EVENT_MOUSE_MOTION:
-                printf("Mouse is moving\n");
-                break;
+            // case SDL_EVENT_MOUSE_MOTION:
+            //     printf("Mouse is moving\n");
+            //     break;
             case SDL_EVENT_MOUSE_BUTTON_DOWN:
                 printf("Mouse button pressed\n");
                 break;
@@ -69,14 +70,14 @@ if(win==NULL){
                 // event.wheel.y > 0 -> scroll up / away from user  -> forward
                 // event.wheel.y < 0 -> scroll down / toward user   -> backward
                 if(event.wheel.y > 0){
-                    printf("Scroll up (forward)\n");
-                    move_camera(30,MOV_FORWARD);
+                    // printf("Scroll up (forward)\n");
+                    move_camera(10,MOV_FORWARD);
                 }
                 else if(event.wheel.y < 0){
-                    printf("Scroll down (backward)\n");
-                    move_camera(30,MOV_BACKWARD);
+                    // printf("Scroll down (backward)\n");
+                    move_camera(10,MOV_BACKWARD);
                 }
-                clear_frame_buffer(false);
+
                 render();
                 update_win(get_frame_buffer());
                 break;
@@ -87,27 +88,26 @@ if(win==NULL){
                 {
                 case SDLK_LEFT:
                     // call your camera / scene handler for LEFT here
-                    printf("Left Arrow key pressed\n");
+                    // printf("Left Arrow key pressed\n");
                     move_camera(30,MOV_LEFT);
                     break;
                 case SDLK_RIGHT:
                     // call your camera / scene handler for RIGHT here
-                    printf("Right Arrow key pressed\n");
+                    // printf("Right Arrow key pressed\n");
                     move_camera(30,MOV_RIGHT);
                     break;
                 case SDLK_UP:
                     // call your camera / scene handler for UP here
-                    printf("Up Arrow key pressed\n");
+                    // printf("Up Arrow key pressed\n");
                     move_camera(30,MOV_UP);
                     break;
                 case SDLK_DOWN:
                     // call your camera / scene handler for DOWN here
-                    printf("Down Arrow key pressed\n");
+                    // printf("Down Arrow key pressed\n");
                     move_camera(30,MOV_DOWN);
                     break;
                 }
 
-                 clear_frame_buffer(false);
                  render();
                  update_win(get_frame_buffer());
                 }

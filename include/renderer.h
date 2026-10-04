@@ -85,8 +85,9 @@ typedef enum Movement{
 extern uint32_t screen_width;
 extern uint32_t screen_hieght;
 extern _Atomic size_t triangle_tracker;
-
-
+extern uint64_t* connector_pool;
+extern size_t connector_pool_len;
+extern uint64_t* obj_end_idx;
 
 
 
@@ -97,12 +98,12 @@ void render_init(Object* objs,uint64_t len,uint32_t win_w,uint32_t win_h);
 // reallocated or replaced. The renderer never grows, copies or frees it.
 void set_objects(Object* objs,uint64_t len);
 bool render();
-void clear_frame_buffer(bool keep_frame);
 void renderer_resize(uint32_t win_w,uint32_t win_h);
 void move_camera(double unit,Movement direction);
 Camera get_camera_pos();
 void* get_frame_buffer();
-Object* get_current_object();
+Object* get_current_object(size_t index);
+size_t get_objects_len();
 
 
 #endif

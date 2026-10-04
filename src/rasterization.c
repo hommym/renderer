@@ -12,6 +12,12 @@
 // geometry projects inverted instead of disappearing.
 #define NEAR_PLANE_MARGIN 1.0
 
+static pthread_mutex_t condition_lock= PTHREAD_MUTEX_INITIALIZER;
+
+static _Atomic bool is_obj_upd=false;
+
+
+
 // Walk t of the way from a to b, in world space and in colour.
 static Vectex lerp_vectex(Vectex a,Vectex b,double t){
 if(t<0.0)t=0.0;
@@ -319,17 +325,30 @@ free(scanline_pixels);
 
 
 void* rasterization_worker(void* args){
-
+size_t obj_end_idx_tracker=0;
 size_t current_triangle_pointer=atomic_fetch_add(&triangle_tracker,3);
-Object obj=*(get_current_object());    
+Object obj;
 
-while(current_triangle_pointer<obj.len_of_connectors){
-Vectex triangle[3]={obj.vertices[obj.connectors_sequence[current_triangle_pointer++]],
-obj.vertices[obj.connectors_sequence[current_triangle_pointer++]],
-obj.vertices[obj.connectors_sequence[current_triangle_pointer]]
+while(current_triangle_pointer<connector_pool_len){
+for (size_t i = 0; i < get_objects_len(); i++)
+{
+if(!(current_triangle_pointer<=obj_end_idx[obj_end_idx_tracker]))obj_end_idx_tracker++;    
+else break;   
+}
+  
+obj=*get_current_object(obj_end_idx_tracker);
+  
+
+
+Vectex triangle[3]={obj.vertices[connector_pool[current_triangle_pointer++]],
+obj.vertices[connector_pool[current_triangle_pointer++]],
+obj.vertices[connector_pool[current_triangle_pointer]]
 };
-rasterizer(triangle,get_current_object());   
+rasterizer(triangle,&obj);   
 current_triangle_pointer=atomic_fetch_add(&triangle_tracker,3); 
 }
+
+
+
 
 }

@@ -26,15 +26,26 @@ static Camera camera={
 
 
 static Object* objects=NULL;
-static Object* object;
 _Atomic size_t triangle_tracker;
+_Atomic size_t object_tracker;
+uint64_t* connector_pool=NULL;
+size_t connector_pool_len;
+uint64_t* obj_end_idx=NULL;
+
 static size_t objects_len=0;
 static void* frame=NULL;
+static void* frame1=NULL;
+static void* frame2=NULL;
 static int num_core=0; // number of cores the running system has
 
 
-Object* get_current_object(){
-    return object;
+
+
+Object* get_current_object(size_t index){
+    return &objects[index];
+}
+size_t get_objects_len(){
+    return objects_len;
 }
 
 static void setup_camera(){
@@ -70,10 +81,23 @@ static void setup_camera(){
 
 
 static void create_frame_buffer(uint32_t win_w,uint32_t win_h){
-frame= calloc((win_h*win_w),sizeof(PixelCord));
+frame1= calloc((win_h*win_w),sizeof(PixelCord));
+frame2= calloc((win_h*win_w),sizeof(PixelCord));
+frame=frame1;
 }
 
+static void* clear_frame_buffer(void* args ){
+   // resets the frame by clearing all the data in that memory
+    if(frame!=frame1){
+        //reset frame1 memory section
+        memset(frame1,0,(screen_hieght*screen_width)*sizeof(PixelCord));
+    }
+    else{
+        //reset frame2 memory section
+         memset(frame2,0,(screen_hieght*screen_width)*sizeof(PixelCord));
+    }
 
+}
 
 Camera get_camera_pos(){
 return camera;
@@ -110,38 +134,36 @@ setup_camera();
 
 bool render(){
 if(frame==NULL)return false;
+if(frame==frame1)frame=frame2;
+else frame=frame1;
+pthread_t frame_clear_thread;
+if (pthread_create(&frame_clear_thread, NULL,clear_frame_buffer, NULL)) {
+            perror("Failed to create thread for memory reset\n");
+            return false;
+        }
 
-PixelCord (*frame_buffer)[screen_width]= (PixelCord (*)[screen_width])frame;   
 
 
-for(size_t x=0;x<objects_len;x++){
-Object obj=objects[x];
+PixelCord (*frame_buffer)[screen_width]= (PixelCord (*)[screen_width])frame;  
 
-// no connectors -> paint each visible vertex as one pixel
-if(obj.len_of_connectors==0){
-    size_t w=obj.texture_width;
-    uint32_t (*texture)[w]=(uint32_t (*)[w]) (obj).texture;
-    for(size_t v=0;v<obj.len_of_vertices;v++){
-        Vectex pt=obj.vertices[v];
-        PixelCord pc={.z=pt.z,.is_visible=false,.in_use=false,.u=pt.u,.v=pt.v};
-        if(!is_vectex_visible(pt,&pc)) continue;
-        pc.px=perspective_projection(pt.x,pt.z,camera.z,camera.focal_l,camera.x,camera.x_end,screen_width);
-        pc.py=perspective_projection(pt.y,pt.z,camera.z,camera.focal_l,camera.y,camera.y_end,screen_hieght);
-        PixelCord point0=frame_buffer[(uint64_t)pc.py][(uint64_t)pc.px];
-        if(point0.in_use && point0.z<pt.z) continue;
-        pc.in_use=true;
-        size_t pc_row=(size_t)(obj.texture_height*pc.v);
-        size_t pc_col=(size_t)(obj.texture_width*pc.u);
-        pc.colour=texture[pc_row][pc_col];
-        frame_buffer[(uint64_t)pc.py][(uint64_t)pc.px]=pc;
+
+for (size_t i = 0; i < objects_len; i++)connector_pool_len+=objects[i].len_of_connectors;
+connector_pool=calloc(connector_pool_len,sizeof(uint64_t));   
+obj_end_idx=calloc(objects_len,sizeof(uint64_t));
+uint64_t pool_tracker=0;   
+for (size_t i = 0; i < objects_len; i++){
+    Object obj=objects[i];
+    for (size_t x = 0; x < obj.len_of_connectors; x++)
+    {
+        connector_pool[pool_tracker]=obj.connectors_sequence[x];
+        pool_tracker++;
     }
-    continue;
+    obj_end_idx[i]=pool_tracker-1;
+    
 }
 
-object=objects+x;    
-atomic_store(&triangle_tracker,0);
-    pthread_t threads[num_core==0?1:num_core]; // Array to hold thread IDs
 
+pthread_t threads[num_core==0?1:num_core]; // Array to hold thread IDs
     // 1. Create multiple threads in a loop
     for (long i = 0; i < num_core && num_core>1; i++) {
         // We cast 'i' to a void* directly to avoid race conditions with local memory
@@ -151,10 +173,11 @@ atomic_store(&triangle_tracker,0);
         }
     }
 
-    //using main thread too in rasterization process
-    rasterization_worker(NULL);
-    
-    // 2. Join multiple threads in a separate loop
+
+//using main thread too in rasterization process
+rasterization_worker(NULL);   
+
+  // 2. Join multiple threads in a separate loop
     // printf("Waiting for threads which are still working to finish to finish...\n");
     for (int i = 0; i < num_core && num_core>1; i++) {
         if (pthread_join(threads[i], NULL) != 0) {
@@ -162,25 +185,27 @@ atomic_store(&triangle_tracker,0);
             return false;
         }
     }
-    
-
-
-}
-
+free(connector_pool);
+free(obj_end_idx);
+connector_pool_len=0;
+triangle_tracker=0;
+pthread_join(frame_clear_thread, NULL);
 return true;
 }
 
-void clear_frame_buffer(bool keep_frame){
-    if(!keep_frame)free(frame);
-    if(screen_hieght!=0 && screen_width!=0)create_frame_buffer(screen_width,screen_hieght);
-    else frame=NULL;
-}
+
 
 void renderer_resize(uint32_t win_w,uint32_t win_h){
     screen_width=win_w;
     screen_hieght=win_h;
     setup_camera();
-    clear_frame_buffer(false);
+    if(frame1!=NULL && frame2!=NULL)
+    {
+        free(frame1);
+        free(frame2);
+    }
+    create_frame_buffer(win_w,win_h);
+    
 }
 
 void move_camera(double unit,Movement direction){
