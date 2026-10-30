@@ -27,25 +27,20 @@ Design notes for the renderer. Companion to `issues.md` — that file tracks wha
 ## 2. Pipeline
 
 ```
-Object[] ──▶ render() ──┬─▶ point-cloud path      (single-threaded)
-                        └─▶ rasterization_worker  (thread pool)
+Object[] ──▶ render() ──▶ connector_pool  (every object's indices, end to end)
                                 │
-                                ├─ clip_triangle_near   world space, against z = camera.z + 1
-                                ├─ perspective_projection   world ──▶ pixel
-                                ├─ bresenhame_line_algo x3   one strip per edge
-                                ├─ scanline gather      cursor per edge, monotonic in py
-                                └─ span fill + depth test ──▶ frame buffer cells (`PixelCord *_Atomic`, compare-exchange)
+                                └─▶ rasterization_worker  (thread pool, claims 3 indices at a time)
+                                        │
+                                        ├─ clip_triangle_near   world space, against z = camera.z + 1
+                                        ├─ perspective_projection   world ──▶ pixel
+                                        ├─ bresenhame_line_algo x3   one strip per edge
+                                        ├─ scanline gather      cursor per edge, monotonic in py
+                                        └─ span fill + depth test ──▶ frame buffer cells (`PixelCord *_Atomic`, compare-exchange)
 ```
 
-Dispatch is by connector count, not by an explicit tag:
+There is no per-object dispatch. `render()` copies every object's `connectors_sequence` into one flat `connector_pool`, and `obj_end_idx[i]` records the last pool index that belongs to object `i`; a worker finds a triangle's object by walking `obj_end_idx`. Every index is read three at a time as a triangle, so an object with `len_of_connectors == 0` contributes nothing and is not drawn. **Point clouds are no longer rendered.**
 
-```
-for obj in objects:
-    if obj.len_of_connectors == 0:  point-cloud path (one pixel per vertex)
-    else:                           triangle raster path (3 indices per triangle)
-```
-
-**Wireframe mode is no longer supported.** `render()` has no mode flag and there is no dispatch to a line path; the renderer draws point clouds and filled triangles only. `bresenhame_line_algo` survives as the edge walker inside the triangle path, which is now its only caller.
+**Wireframe mode is no longer supported.** `render()` has no mode flag and there is no dispatch to a line path; the renderer draws filled triangles only. `bresenhame_line_algo` survives as the edge walker inside the triangle path, which is now its only caller.
 
 ---
 
@@ -53,10 +48,9 @@ for obj in objects:
 
 - `render_init(objs, len, win_w, win_h)` — allocates the frame buffers and one pixel pool per rasterizing thread, records the object array and screen size, derives the camera lens, and caches the worker count. Call once.
 - `set_objects(objs, len)` — re-point the renderer at the caller's object array. See §9. Not safe to call concurrently with `render()`.
-- `render()` — walks every `Object` and fills the frame buffer. Returns false only if the frame buffer is NULL.
-- `clear_frame_buffer(keep_frame)` — allocates a fresh grid at the current screen size. `keep_frame == true` is currently broken (`issues.md` §7).
+- `render()` — swaps to the other frame buffer, clears the one just shown on a helper thread, and draws every object's triangles into the new one (§4, §9). Returns false if the frame buffer is NULL or a thread cannot be created or joined.
 - `renderer_resize(win_w, win_h)` — updates screen size, re-derives the camera, reallocates the frame buffer.
-- `move_camera(unit, direction)` — translates the camera by `unit` world units along one axis. Near value and matching far-plane extent shift together, so the view volume slides rigidly. Does *not* clear the frame buffer; the caller does that.
+- `move_camera(unit, direction)` — translates the camera by `unit` world units along one axis. Near value and matching far-plane extent shift together, so the view volume slides rigidly. Does not redraw; the caller calls `render()` afterwards.
 - `get_camera_pos()` — snapshot copy of the `Camera`. Mutating the result does nothing.
 - `get_frame_buffer()` — raw pointer to the grid of `PixelCord *_Atomic` cells being drawn (§9).
 - `get_current_object()` — the `Object` the worker pool is currently on. Only meaningful between thread spawn and join.
@@ -111,9 +105,9 @@ Measured against giving each thread its own rows (every thread walks every trian
 
 Whether a cell has been drawn is not a field: an empty cell is a NULL pointer (§9).
 
-**`Object`** — `vertices[]` plus a flat `connectors_sequence[]` of indices into it, read three at a time, plus one texture (`texture`, `texture_width`, `texture_height`) shared by every vertex. `len_of_connectors == 0` means point cloud.
+**`Object`** — `vertices[]` plus a flat `connectors_sequence[]` of indices into it, read three at a time, plus one texture (`texture`, `texture_width`, `texture_height`) shared by every vertex. An object with `len_of_connectors == 0` is not drawn (§2).
 
-`texture` is dereferenced unconditionally by both draw paths, so it is never allowed to be NULL: an object with no image gets a 1x1 texture of its flat colour instead. One texture per object is also the whole multi-material limitation (`issues.md` §11).
+`texture` is dereferenced unconditionally when drawing, so it is never allowed to be NULL: an object with no image gets a 1x1 texture of its flat colour instead. One texture per object is also the whole multi-material limitation (`issues.md` §11).
 
 **`Camera`** — axis-aligned frustum: position `(x,y,z)`, far-plane extents `(x_end,y_end,z_end)`, and lens fields `focal_l`, `v_fov`, `h_fov`. No rotation (`issues.md` §4).
 
@@ -136,13 +130,13 @@ h_fov   = 2 * atan(screen_width / (2 * focal_l)) // 81.79° at 1500x1000
 
 ### Screen-bounds contract
 
-`is_vectex_visible` tests a world-space point against the frustum by scaling `camera.x`/`x_end` and `camera.y`/`y_end` — the extents at the far plane — back to that point's own depth. That test is the algebraic inverse of `perspective_projection`, which gives the invariant the renderer relies on:
+`is_vectex_visible` tests a world-space point against the frustum by scaling `camera.x`/`x_end` and `camera.y`/`y_end` — the extents at the far plane — back to that point's own depth. That test is the algebraic inverse of `perspective_projection`, which gives this invariant:
 
 > a point that passes `is_vectex_visible` always projects to a pixel inside `[0, screen_width)` x `[0, screen_hieght)`.
 
-That is why the point-cloud path writes `frame_buffer[py][px]` without a bounds check — visibility is decided in world space, before projecting, and the two calculations cannot disagree. Verified against vertices at `z = -50` (behind the lens, frustum interval inverts and rejects), `z = 0` (interval collapses to empty) and `z = 0.001` (interval is a fraction of a world unit wide): all culled, nothing out of range.
+The point-cloud path relied on it to write `frame_buffer[py][px]` without a bounds check; that path is gone, and today the invariant only backs the triangle path's early cull, which skips a triangle when none of its three vertices passes. Verified against vertices at `z = -50` (behind the lens, frustum interval inverts and rejects), `z = 0` (interval collapses to empty) and `z = 0.001` (interval is a fraction of a world unit wide): all culled, nothing out of range.
 
-The invariant is not asserted anywhere, so it is a real constraint on both functions: changing the projection formula without matching `is_vectex_visible` reintroduces out-of-bounds writes. The triangle path does not depend on it — Bresenham re-gates every pixel and the span fill clamps to the screen before writing.
+The invariant is not asserted anywhere. Nothing writes out of bounds if it breaks — Bresenham re-gates every pixel and the span fill clamps to the screen before writing — but any future path that writes projected points directly, as the point-cloud path did, depends on `perspective_projection` and `is_vectex_visible` staying exact inverses.
 
 ### Near plane
 

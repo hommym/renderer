@@ -16,11 +16,11 @@ Open problems in the renderer. Each entry: what breaks, why it breaks, fix direc
 
 ## 3. `Object` cannot distinguish a triangle list from an edge list
 
-**What breaks.** `render()` sends any object with `len_of_connectors != 0` to the triangle rasterizer, which reads `connectors_sequence` three at a time. Nothing records how many indices per primitive the array actually holds.
+**What breaks.** `render()` sends every object's `connectors_sequence` to the triangle rasterizer, which reads it three at a time. Nothing records how many indices per primitive the array actually holds.
 
-**Why.** `model_data.h` ships two index arrays over the same vertices: `model_connectors` (pairs, 392,102 entries) and `model_tri_connectors` (triples, 2,534,133 entries). They differ only by which field an `Object` literal points at. 392,102 is not divisible by 3, so feeding the pair list to the raster path both draws nonsense *and* over-reads the end of the array — the worker loop's `p < len_of_connectors` bound is only safe because a triangle list's length is always a multiple of 3.
+**Why.** `model_data.h` ships two index arrays over the same vertices: `model_connectors` (pairs, 392,102 entries) and `model_tri_connectors` (triples, 2,534,133 entries). They differ only by which field an `Object` literal points at. 392,102 is not divisible by 3, so feeding the pair list to the raster path draws nonsense. Because `connector_pool` holds every object's indices end to end, it also shifts the triangle boundaries of every object after it, and the last triple can over-read the pool — the worker's `current_triangle_pointer < connector_pool_len` bound only checks the first index of a triple.
 
-**Fix path.** Either add an explicit primitive-kind tag to `Object` (also removes the `len_of_connectors == 0` point-cloud dispatch trick), or make the worker bound independent of the assumption: `while(p + 2 < obj.len_of_connectors)`.
+**Fix path.** Either add an explicit primitive-kind tag to `Object` (which would also let `render()` draw point clouds again), or refuse index counts that are not a multiple of 3 when building `connector_pool` and bound the worker on the whole triple: `current_triangle_pointer + 2 < connector_pool_len`.
 
 ---
 
@@ -65,20 +65,13 @@ So it is real but currently invisible: half the pixels of the forest land on a *
 
 ---
 
-## 7. `clear_frame_buffer(true)` leaks the old buffer
+## 7. Frame-buffer allocations are never checked
 
-**What breaks.** Calling it with `keep_frame == true` leaks the previous frame buffer — one full `screen_width * screen_height * sizeof(PixelCord)` allocation per call (48 MB at 1500x1000).
+**What breaks.** If memory runs out while allocating, the renderer crashes instead of failing cleanly.
 
-**Why.** `renderer.c:158`:
+**Why.** `create_frame_buffer` never checks its two `calloc` results, and `render_init` does not check the pixel-pool `calloc` either. `render()` tests `frame == NULL` only *before* swapping buffers, so a failed `frame2` is swapped in and drawn into anyway. `update_win()` never checks its buffer at all, and both callers (`main.c` and the event loop in `win_i_o.c`) ignore `render()`'s return value.
 
-```c
-if(!keep_frame) free(frame);
-if(screen_hieght!=0 && screen_width!=0) create_frame_buffer(screen_width,screen_hieght);
-```
-
-`create_frame_buffer` unconditionally overwrites `frame` with a fresh `calloc`, so skipping the `free` does not keep the old buffer reachable — it strands it. No caller passes `true` today (all three call sites pass `false`), but `ARCHITECTURE.md` documents the flag as meaning the old buffer "still exists and can be referenced".
-
-**Fix path.** Decide what the flag means. If it is "reuse the existing allocation", return early instead of reallocating. If it is "hand ownership of the old buffer to the caller", it has to return the pointer. `create_frame_buffer` also never checks its `calloc` result; `render()` guards on `frame == NULL` but `update_win()` does not.
+**Fix path.** Check all three allocations and have `render_init` report failure (it returns `void` today). Test the buffer after the swap in `render()`, and only call `update_win()` when `render()` returned true.
 
 ---
 
