@@ -8,7 +8,7 @@ Design notes for the renderer. Companion to `issues.md` — that file tracks wha
 
 | File | Responsibility |
 | --- | --- |
-| `src/renderer.c` | Renderer state (camera, frame buffer, object list), `render()` dispatch, thread pool lifecycle |
+| `src/renderer.c` | Renderer state (camera, frame buffers, pixel pools, object list), `render()` dispatch, thread pool lifecycle |
 | `src/rasterization.c` | Near-plane clip, projection, scanline triangle fill. The worker body. |
 | `src/wireframe.c` | `bresenhame_line_algo` — walks one segment, emits one `PixelCord` per step with interpolated z and texture coordinates |
 | `src/projection.c` | `perspective_projection` — one axis of the perspective divide |
@@ -34,7 +34,7 @@ Object[] ──▶ render() ──┬─▶ point-cloud path      (single-thread
                                 ├─ perspective_projection   world ──▶ pixel
                                 ├─ bresenhame_line_algo x3   one strip per edge
                                 ├─ scanline gather      cursor per edge, monotonic in py
-                                └─ span fill + depth test ──▶ PixelCord grid (`frame`)
+                                └─ span fill + depth test ──▶ frame buffer cells (`PixelCord *_Atomic`, compare-exchange)
 ```
 
 Dispatch is by connector count, not by an explicit tag:
@@ -51,14 +51,14 @@ for obj in objects:
 
 ## 3. API
 
-- `render_init(objs, len, win_w, win_h)` — allocates the frame buffer, records the object array and screen size, derives the camera lens, and caches the worker count. Call once.
+- `render_init(objs, len, win_w, win_h)` — allocates the frame buffers and one pixel pool per rasterizing thread, records the object array and screen size, derives the camera lens, and caches the worker count. Call once.
 - `set_objects(objs, len)` — re-point the renderer at the caller's object array. See §9. Not safe to call concurrently with `render()`.
 - `render()` — walks every `Object` and fills the frame buffer. Returns false only if the frame buffer is NULL.
 - `clear_frame_buffer(keep_frame)` — allocates a fresh grid at the current screen size. `keep_frame == true` is currently broken (`issues.md` §7).
 - `renderer_resize(win_w, win_h)` — updates screen size, re-derives the camera, reallocates the frame buffer.
 - `move_camera(unit, direction)` — translates the camera by `unit` world units along one axis. Near value and matching far-plane extent shift together, so the view volume slides rigidly. Does *not* clear the frame buffer; the caller does that.
 - `get_camera_pos()` — snapshot copy of the `Camera`. Mutating the result does nothing.
-- `get_frame_buffer()` — raw pointer to the `PixelCord` grid.
+- `get_frame_buffer()` — raw pointer to the grid of `PixelCord *_Atomic` cells being drawn (§9).
 - `get_current_object()` — the `Object` the worker pool is currently on. Only meaningful between thread spawn and join.
 
 ---
@@ -67,12 +67,35 @@ for obj in objects:
 
 Work is partitioned **by triangle**, using a shared atomic cursor rather than a precomputed split:
 
-- `render_init` sets `num_core = get_number_of_cores() - 1` (one less, because the main thread also rasterizes).
-- Per object, `render()` resets `triangle_tracker` to 0, spawns `num_core` workers, runs `rasterization_worker` on the main thread too, then joins.
+- `render_init` sets `num_core = get_number_of_cores() - 1` (one less, because the main thread also rasterizes) and creates `num_core + 1` pixel pools, one per rasterizing thread.
+- `render()` copies every object's indices into one flat `connector_pool`, with `obj_end_idx` marking where each object ends. It spawns `num_core` workers with indices `0 … num_core-1`, runs `rasterization_worker` on the main thread with index `num_core`, then joins. Workers only spawn when `num_core > 1`, so a 2-core machine draws on the main thread alone.
 - Each worker calls `atomic_fetch_add(&triangle_tracker, 3)` to claim the next triangle, so chunks are handed out as 0, 3, 6, … Threads that finish a cheap triangle immediately claim another — self-balancing, which matters because triangle cost varies by orders of magnitude with screen area.
-- `object` and the frame buffer are published before `pthread_create` and read after `pthread_join`, so those are ordered. **The frame buffer itself is not synchronised** — this is the significant open bug, `issues.md` §1.
+- A thread's index picks its pixel pool, so no two threads ever hand out the same `PixelCord`.
+- The objects and the frame buffer are published before `pthread_create` and read after `pthread_join`, so those are ordered.
 
-Only the triangle path is threaded. The point-cloud path runs on the calling thread.
+Because triangles are handed out freely, two threads routinely draw the same pixel at the same time. Each depth test is therefore made atomic with a compare-exchange on the cell:
+
+```c
+PixelCord *existing = atomic_load(cell);
+bool is_update_correct = false;
+while (!is_update_correct) {
+    if (!(existing != NULL && existing->z < pixel.z))
+        is_update_correct = store_pixel(cell, pixel, pool, existing);
+    else break;                         // a closer pixel is already there
+    if (!is_update_correct)
+        existing = atomic_load(cell);   // another thread changed the cell: test again
+}
+```
+
+`store_pixel` copies the pixel into the thread's pool, then calls `atomic_compare_exchange_strong(cell, &expected, stored)`: the new pointer goes in only if the cell still holds the pixel the depth test was run against. If another thread got there first, the swap fails and the test is re-run against whatever is there now.
+
+- **Complete pixels only.** The copy is finished before the swap publishes it, and cells are always read with `atomic_load`, so a thread that follows a cell's pointer sees a whole `PixelCord`.
+- **No ABA within a frame.** A published `PixelCord` is never modified, and pool memory is not reused until the next `render()`, so a cell cannot swing back to a pointer a thread has already compared against.
+- **Ties are not deterministic.** At equal depth the last successful swap wins, so pixels where two triangles tie (a shared edge, two objects meeting) can differ between runs. Nothing is corrupted; break ties on something stable, such as triangle index, if bit-identical frames matter.
+
+Verified with 1, 3, 4, 6 and 8 threads at `-O0` and `-O2`: every frame identical to the single-threaded frame, and ThreadSanitizer reports no data races.
+
+Measured against giving each thread its own rows (every thread walks every triangle and writes only rows where `row % threads == index`, with no atomics): compare-exchange is faster at every thread count above 1 — at 8 threads, 48 vs 60 ms on 240 large triangles and 22 vs 91 ms on 20,000 small ones (Debug build). The row split loses because every thread repeats every triangle's setup, which dominates for small triangles.
 
 ---
 
@@ -82,10 +105,11 @@ Only the triangle path is threaded. The point-cloud path runs on the calling thr
 
 `u` and `v` are the drawn colour; `colour` is not (`issues.md` §9). Both must lie in `[0,1)` — the rasterizer turns them into array subscripts with no bounds check, so `1.0` is one texel past the end. `mesh.h` makes that part of the load contract.
 
-**`PixelCord`** — screen-space position (`px`,`py`), the world-space depth `z` it came from, its texture coordinate, its resolved colour, and two flags. Serves three roles: a projected vertex, one step along a Bresenham strip, and a frame-buffer cell.
+**`PixelCord`** — screen-space position (`px`,`py`), the world-space depth `z` it came from, its texture coordinate, its resolved colour, and a visibility flag. 40 bytes. Serves three roles: a projected vertex, one step along a Bresenham strip, and the stored pixel a frame-buffer cell points at.
 
-- `.in_use` — this cell has been written by `render()`. Doubles as the z-buffer occupancy bit: an unused cell always loses the depth test.
-- `.is_visible` — passed the frustum / screen-bounds test. Cells failing it are never stored.
+- `.is_visible` — passed the frustum / screen-bounds test. Pixels failing it are never stored.
+
+Whether a cell has been drawn is not a field: an empty cell is a NULL pointer (§9).
 
 **`Object`** — `vertices[]` plus a flat `connectors_sequence[]` of indices into it, read three at a time, plus one texture (`texture`, `texture_width`, `texture_height`) shared by every vertex. `len_of_connectors == 0` means point cloud.
 
@@ -167,11 +191,12 @@ Colour is resolved last, per pixel: the span lerp carries `u`/`v`, and `texture[
 
 ## 9. Frame buffer ownership
 
-- Allocated by `create_frame_buffer(w,h)` with `calloc`, stored as `void* frame`.
-- Reinterpreted as `PixelCord (*)[screen_width]` inside `render()` and `rasterizer()`; as a flat `PixelCord*` inside `update_win()`.
-- Never cleared per frame automatically — callers call `clear_frame_buffer(false)` (currently `renderer_resize` and the event handlers).
-- Depth arbitration is the `.in_use` + `.z` compare at each write site. There is no separate depth array.
-- `update_win` flattens it to ARGB: `.in_use` cells paint their own colour, empty cells paint white.
+- Two buffers, `frame1` and `frame2`, each `screen_width * screen_hieght` cells of type `PixelCord *_Atomic`. Allocated by `create_frame_buffer(w,h)` with `calloc`, so every cell starts NULL (an atomic pointer is lock-free and pointer-sized here, so all-zero bytes are NULL). Stored as `void*`; `frame` points at the one being drawn.
+- A cell is NULL (nothing drawn) or points at a `PixelCord` in one of the pixel pools. Each rasterizing thread has its own pool: a linked list of 65,536-`PixelCord` blocks that are never moved, kept across frames and rewound at the start of every `render()`. A pointer therefore stays valid until the next `render()`, by which time its frame has been shown.
+- `render()` swaps `frame` to the other buffer, then a helper thread `memset`s the one just shown back to NULL while the rasterizers draw. That `memset` is the only non-atomic access to the cells; it is safe because no rasterizer touches that buffer.
+- Reinterpreted as `PixelCell (*)[screen_width]` inside `rasterizer()` (`typedef PixelCord *_Atomic PixelCell;` — the `_Atomic(T)` spelling is avoided because VS Code's IntelliSense rejects it), and as a flat `PixelCord *_Atomic *` inside `update_win()`.
+- Depth arbitration is the load / compare / compare-exchange loop in §4. There is no separate depth array.
+- `update_win` flattens it to ARGB: a non-NULL cell paints its pixel's colour, composited over the background by its alpha; a NULL cell paints white.
 - `Object.vertices`, `Object.connectors_sequence` and `Object.texture` are owned by whoever created the `Object`; the renderer never frees them.
 
 ### Scene list

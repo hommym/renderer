@@ -58,7 +58,6 @@ double px;
 double py;
 double z;
 bool is_visible;
-bool in_use;
 float  u;
 float  v;
 uint32_t colour;
@@ -104,6 +103,14 @@ Camera get_camera_pos();
 void* get_frame_buffer();
 Object* get_current_object(size_t index);
 size_t get_objects_len();
+
+// The frame buffer is a grid of atomic PixelCord pointers (PixelCord *_Atomic),
+// NULL where nothing has been drawn. The cells are atomic; the PixelCords they
+// point at are not, and live in these pools: one per rasterizer thread, rewound
+// at the start of every render().
+typedef struct PixelPool PixelPool;
+PixelPool* get_pixel_pool(size_t index);
+PixelCord* pixel_pool_take(PixelPool* pool);
 
 
 #endif

@@ -156,7 +156,7 @@ uint32_t b=((argb&0xFFu)*a+bb*ia+127u)/255u;
 return 0xFF000000u|(r<<16)|(g<<8)|b;
 }
 
-void update_win(PixelCord* frame_buffer){
+void update_win(PixelCord *_Atomic *frame_buffer){
 if(win==NULL){
     printf("No window to update\n");
     return;
@@ -195,13 +195,14 @@ if(pixel_buffer==NULL || pb_w!=w || pb_h!=h){
     pb_h=h;
 }
 
-// flatten the PixelCord grid into ARGB pixels for SDL.
-// empty cells (never written by render()) paint as the background;
-// occupied cells (.in_use==true) are composited over it by their own alpha.
+// flatten the frame buffer into ARGB pixels for SDL.
+// empty cells (NULL: never written by render()) paint as the background;
+// occupied cells are composited over it by their own alpha.
 size_t total=(size_t)w*(size_t)h;
 for(size_t i=0;i<total;i++){
-    pixel_buffer[i]=frame_buffer[i].in_use ? blend_over_background(frame_buffer[i].colour)
-                                           : BACKGROUND_ARGB;
+    PixelCord* cell=atomic_load(&frame_buffer[i]);
+    pixel_buffer[i]=cell!=NULL ? blend_over_background(cell->colour)
+                               : BACKGROUND_ARGB;
 }
 
 SDL_UpdateTexture(sdl_texture,NULL,pixel_buffer,w*(int)sizeof(uint32_t));

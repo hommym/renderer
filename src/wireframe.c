@@ -81,7 +81,7 @@ float u=interpolate(u_start,u_end,ch_x,lines_arr_pointer);
 float v=interpolate(v_start,v_end,ch_x,lines_arr_pointer);
 
 bool is_visible= (x>=0&&x<screen_width) && (y>=0&&y<screen_hieght) && z>=camera.z&&z<=camera.z_end;
-lines_arr[lines_arr_pointer]=(PixelCord){.px=x,.py=y,.z=z,.in_use=true,.is_visible=is_visible,.u=u,.v=v};
+lines_arr[lines_arr_pointer]=(PixelCord){.px=x,.py=y,.z=z,.is_visible=is_visible,.u=u,.v=v};
 lines_arr_pointer++;
 error+=slope;
 if(error>=0.5){
@@ -137,7 +137,7 @@ double z=interpolate(z_start,z_end,ch_y,lines_arr_pointer);
 float u=interpolate(u_start,u_end,ch_y,lines_arr_pointer);
 float v=interpolate(v_start,v_end,ch_y,lines_arr_pointer);
 bool is_visible= (x>=0&&x<screen_width) && (y>=0&&y<screen_hieght) && z>=camera.z&&z<=camera.z_end;
-lines_arr[lines_arr_pointer]= (PixelCord){.px=x,.py=y,.z=z,.in_use=true,.is_visible=is_visible,.u=u,.v=v};
+lines_arr[lines_arr_pointer]= (PixelCord){.px=x,.py=y,.z=z,.is_visible=is_visible,.u=u,.v=v};
 lines_arr_pointer++;
 error+=slope;
 if(error>=0.5){

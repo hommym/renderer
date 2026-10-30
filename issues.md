@@ -4,38 +4,13 @@ Open problems in the renderer. Each entry: what breaks, why it breaks, fix direc
 
 ---
 
-## 1. The frame buffer is raced by the rasterization threads
-
-**What breaks.** The same scene renders differently every run. Some pixels end up holding a combination of values that no triangle ever produced.
-
-**Why.** `rasterization.c:289-294` (span fill) and `rasterization.c:303-308` (edge pixel) both do an unsynchronised read-modify-write:
-
-```c
-PixelCord existing = frame_buffer[y][x];              // 1. read
-if(!(existing.in_use && existing.z < fill_pixel.z))   // 2. decide
-    frame_buffer[y][x] = fill_pixel;                  // 3. write
-```
-
-Work is partitioned **by triangle**, so two threads routinely land on the same pixel. Two failures follow:
-
-- *Lost update.* Both threads read the same `existing`, both conclude they are in front, and the second write clobbers the first. The depth test was answered correctly about a state that no longer existed, so the farther fragment can win.
-- *Torn write.* `sizeof(PixelCord) == 32` — four 64-bit words, not one atomic store. Two threads writing the same pixel interleave inside the copy.
-
-Measured on 240 overlapping triangles with 8 workers: identical input, 8 runs, 8 different frame hashes at a constant 922,437 painted pixels. Between 78 and 943 pixels per run carried one triangle's colour beside another triangle's depth — a pairing that cannot exist in the input.
-
-The cube hides this because 12 triangles barely contend for the same pixel; a real mesh contends at every overlap and silhouette.
-
-**Fix path.** Partition so no two threads can address the same pixel, rather than locking. Interleave by screen row (thread `i` owns rows where `row % nthreads == i`) or by tile: every thread still walks every triangle, but only writes rows it owns, so the depth test stays a plain read-modify-write on private memory. Costs redundant clip/project per thread; the fill work — the expensive part — still divides. A mutex per pixel is impractical and one global lock removes the point of threading.
-
----
-
 ## 2. `rasterization_worker` falls off the end without returning
 
 **What breaks.** Undefined behaviour on every worker exit.
 
-**Why.** `rasterization.c:321` declares `void* rasterization_worker(void* args)` and the function body ends after the `while` loop with no `return`. Reaching the closing brace of a non-`void` function and having the caller use the value is UB. `pthread_join` is passed `NULL` for the result today, so nothing reads it and it does not misbehave in practice.
+**Why.** `rasterization.c:391` declares `void* rasterization_worker(void* args)` and the function body ends after the `while` loop with no `return`. Reaching the closing brace of a non-`void` function and having the caller use the value is UB. `pthread_join` is passed `NULL` for the result today, so nothing reads it and it does not misbehave in practice.
 
-**Fix path.** `return NULL;` at the end. `args` is also unused (`-Wunused-parameter`) — cast it to void or use it, since the worker index is currently passed and discarded.
+**Fix path.** `return NULL;` at the end.
 
 ---
 
@@ -61,7 +36,7 @@ The cube hides this because 12 triangles barely contend for the same pixel; a re
 
 ## 5. No back-face culling
 
-**What breaks.** Every triangle of a closed mesh is rasterized, including the roughly half facing away from the camera. They are then discarded by the depth compare, so the output is correct but up to twice the fill work is wasted — and under issue 1, back faces are extra contention on the same pixels.
+**What breaks.** Every triangle of a closed mesh is rasterized, including the roughly half facing away from the camera. They are then discarded by the depth compare, so the output is correct but up to twice the fill work is wasted — and with several threads, back faces add contention on the same pixels.
 
 **Why.** There is no winding-order test. `clip_triangle_near` also does not preserve winding when it splits a triangle, so a culling test would need to establish orientation from the projected vertices rather than trusting index order.
 
@@ -109,7 +84,7 @@ if(screen_hieght!=0 && screen_width!=0) create_frame_buffer(screen_width,screen_
 
 ## 8. The rasterizer indexes the texture with no bounds check
 
-**What breaks.** `rasterization.c:290-291` and `:305-306` compute
+**What breaks.** `rasterization.c:343-344` and `:367-368` compute
 
 ```c
 size_t f_row=(size_t)(obj->texture_height*fill_pixel.v);
@@ -131,7 +106,7 @@ A hand-built `Object` (the cube in `main.c`) is not covered by any of that; its 
 
 **What breaks.** A mesh whose colour lives per vertex and not in an image — PLY `red/green/blue`, glTF `COLOR_0`, the non-standard OBJ `v x y z r g b` — renders as one flat colour.
 
-**Why.** The rasterizer overwrites every pixel's colour with a texture sample (`rasterization.c:293`, `:307`) rather than using the interpolated `current.colour`. The loaders still fill `Vectex.colour`, and the flat fallback texture is built from it (PLY averages every vertex colour into its 1x1 texture), so the model gets its overall tone but none of its variation.
+**Why.** The rasterizer overwrites every pixel's colour with a texture sample (`rasterization.c:346`, `:369`) rather than using the interpolated `current.colour`. The loaders still fill `Vectex.colour`, and the flat fallback texture is built from it (PLY averages every vertex colour into its 1x1 texture), so the model gets its overall tone but none of its variation.
 
 There is no way to fix this in the loader: a texture lookup cannot reproduce per-vertex colour, because interpolating `u,v` across a triangle sweeps a rectangle of unrelated texels rather than blending three corner colours.
 

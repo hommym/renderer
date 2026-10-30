@@ -119,9 +119,31 @@ bool is_vectex_visible(Vectex point, PixelCord *pxcord_p)
     return (*pxcord_p).is_visible;
 }
 
-static void rasterizer(Vectex source_triangle[3], Object *obj)
+// One frame-buffer cell: an atomic pointer to the PixelCord drawn there, NULL
+// where nothing has been drawn. Named so the frame buffer's declaration never
+// spells `_Atomic(`, which VS Code's IntelliSense does not accept.
+typedef PixelCord *_Atomic PixelCell;
+
+// Point a frame-buffer cell at a copy of px. px is a local that dies with its
+// loop iteration, so the cell can't point at it; the copy lives in this
+// thread's pool until the next render(). If the pool can't grow, the pixel is
+// simply not drawn. The copy is finished before the atomic store publishes it,
+// so a thread that loads the cell always sees a complete PixelCord.
+static bool store_pixel(PixelCord *_Atomic *cell, PixelCord px, PixelPool *pool, PixelCord *expected)
 {
-    PixelCord(*frame_buffer)[screen_width] = (PixelCord(*)[screen_width])get_frame_buffer();
+    PixelCord *stored = pixel_pool_take(pool);
+    if (stored == NULL){
+        printf("Out of memory");
+        abort();
+
+    }
+    *stored = px;
+    return atomic_compare_exchange_strong(cell, &expected, stored);
+}
+
+static void rasterizer(Vectex source_triangle[3], Object *obj, PixelPool *pool)
+{
+    PixelCell(*frame_buffer)[screen_width] = (PixelCell(*)[screen_width])get_frame_buffer();
     size_t w = (*obj).texture_width;
 
     uint32_t (*texture)[w] = (uint32_t (*)[w])(*obj).texture;
@@ -173,7 +195,7 @@ static void rasterizer(Vectex source_triangle[3], Object *obj)
 
                     if (!outer_projected)
                     {
-                        triangle_proj[edge_a] = (PixelCord){.z = v1.z, .u = v1.u, .v = v1.v, .is_visible = triangle_proj[edge_a].is_visible, .in_use = true};
+                        triangle_proj[edge_a] = (PixelCord){.z = v1.z, .u = v1.u, .v = v1.v, .is_visible = triangle_proj[edge_a].is_visible};
                         triangle_proj[edge_a].px = perspective_projection(v1.x, v1.z, get_camera_pos().z, get_camera_pos().focal_l, get_camera_pos().x, get_camera_pos().x_end, screen_width);
                         triangle_proj[edge_a].py = perspective_projection(v1.y, v1.z, get_camera_pos().z, get_camera_pos().focal_l, get_camera_pos().y, get_camera_pos().y_end, screen_hieght);
 
@@ -181,7 +203,7 @@ static void rasterizer(Vectex source_triangle[3], Object *obj)
                         min_y = triangle_proj[edge_a].py;
                         max_y = triangle_proj[edge_a].py;
                     }
-                    triangle_proj[edge_b] = (PixelCord){.z = v2.z, .u = v2.u, .v = v2.v, .is_visible = triangle_proj[edge_b].is_visible, .in_use = true};
+                    triangle_proj[edge_b] = (PixelCord){.z = v2.z, .u = v2.u, .v = v2.v, .is_visible = triangle_proj[edge_b].is_visible};
                     triangle_proj[edge_b].px = perspective_projection(v2.x, v2.z, get_camera_pos().z, get_camera_pos().focal_l, get_camera_pos().x, get_camera_pos().x_end, screen_width);
                     triangle_proj[edge_b].py = perspective_projection(v2.y, v2.z, get_camera_pos().z, get_camera_pos().focal_l, get_camera_pos().y, get_camera_pos().y_end, screen_hieght);
 
@@ -311,31 +333,51 @@ static void rasterizer(Vectex source_triangle[3], Object *obj)
                             // how far along the span this pixel sits. derived from fill_x rather
                             // than counted, so clamping the start cannot shift the gradient.
                             size_t fill_i = (size_t)(fill_x - current.px);
-                            PixelCord fill_pixel = {.py = current.py, .px = fill_x, .z = interpolate(current.z, next.z, span, fill_i), .u = interpolate(current.u, next.u, span, fill_i), .v = interpolate(current.v, next.v, span, fill_i), .in_use = true};
+                            PixelCord fill_pixel = {.py = current.py, .px = fill_x, .z = interpolate(current.z, next.z, span, fill_i), .u = interpolate(current.u, next.u, span, fill_i), .v = interpolate(current.v, next.v, span, fill_i)};
                             fill_pixel.is_visible = (current.py >= 0 && current.py < screen_hieght) && fill_pixel.z >= get_camera_pos().z && fill_pixel.z <= get_camera_pos().z_end;
                             if (!fill_pixel.is_visible)
                                 continue;
-                            PixelCord existing = frame_buffer[(uint64_t)fill_pixel.py][(uint64_t)fill_pixel.px];
+
+                            PixelCord *existing = atomic_load(&frame_buffer[(uint64_t)fill_pixel.py][(uint64_t)fill_pixel.px]);
                             size_t f_row = (size_t)((*obj).texture_height * fill_pixel.v);
                             size_t f_col = (size_t)((*obj).texture_width * fill_pixel.u);
 
                             fill_pixel.colour = texture[f_row][f_col];
                             // z-buffer test: only overwrite if this pixel is closer to the get_camera_pos().
-                            if (!(existing.in_use && existing.z < fill_pixel.z))
-                                frame_buffer[(uint64_t)fill_pixel.py][(uint64_t)fill_pixel.px] = fill_pixel;
+                            // a NULL cell has nothing drawn in it yet, so anything wins.
+                            bool is_update_correct = false;
+                            while (!is_update_correct)
+                            {
+                                if (!(existing != NULL && existing->z < fill_pixel.z))
+                                    is_update_correct = store_pixel(&frame_buffer[(uint64_t)fill_pixel.py][(uint64_t)fill_pixel.px], fill_pixel, pool, existing);
+
+                                else break;    
+                                if (!is_update_correct)
+                                    existing = atomic_load(&frame_buffer[(uint64_t)fill_pixel.py][(uint64_t)fill_pixel.px]);
+                            }
                         }
                     }
                 }
 
                 if (!current.is_visible)
                     continue;
-                PixelCord existing = frame_buffer[(uint64_t)current.py][(uint64_t)current.px];
+
+                PixelCord *existing = atomic_load(&frame_buffer[(uint64_t)current.py][(uint64_t)current.px]);
                 size_t c_row = (size_t)((*obj).texture_height * current.v);
                 size_t c_col = (size_t)((*obj).texture_width * current.u);
                 current.colour = texture[c_row][c_col];
                 // z-buffer test again for the edge pixel itself.
-                if (!(existing.in_use && existing.z < current.z))
-                    frame_buffer[(uint64_t)current.py][(uint64_t)current.px] = current;
+
+                bool is_update_correct = false;
+                while (!is_update_correct)
+                {
+                    if (!(existing != NULL && existing->z < current.z))
+                        is_update_correct = store_pixel(&frame_buffer[(uint64_t)current.py][(uint64_t)current.px], current, pool, existing);
+
+                    else break;    
+                    if (!is_update_correct)
+                        existing = atomic_load(&frame_buffer[(uint64_t)current.py][(uint64_t)current.px]);
+                }
             }
         }
 
@@ -347,6 +389,8 @@ static void rasterizer(Vectex source_triangle[3], Object *obj)
 
 void *rasterization_worker(void *args)
 {
+    // render() hands every rasterizer thread its own index, which picks its pool
+    PixelPool *pool = get_pixel_pool((size_t)args);
     size_t obj_end_idx_tracker = 0;
     size_t current_triangle_pointer = atomic_fetch_add(&triangle_tracker, 3);
     Object obj;
@@ -366,7 +410,7 @@ void *rasterization_worker(void *args)
         Vectex triangle[3] = {obj.vertices[connector_pool[current_triangle_pointer++]],
                               obj.vertices[connector_pool[current_triangle_pointer++]],
                               obj.vertices[connector_pool[current_triangle_pointer]]};
-        rasterizer(triangle, &obj);
+        rasterizer(triangle, &obj, pool);
         current_triangle_pointer = atomic_fetch_add(&triangle_tracker, 3);
     }
 }

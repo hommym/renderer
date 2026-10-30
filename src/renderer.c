@@ -38,6 +38,26 @@ static void* frame1=NULL;
 static void* frame2=NULL;
 static int num_core=0; // number of cores the running system has
 
+// The PixelCords the frame buffer points at. Each rasterizer thread takes from
+// its own pool, so two threads never hand out the same PixelCord. Blocks are
+// linked, never realloc'd, so a pointer handed out stays valid until the next
+// render() rewinds the pools; the blocks themselves are kept and reused.
+#define PIXEL_POOL_BLOCK 65536 // PixelCords per block, 2.5MB at 40 bytes each
+
+typedef struct PixelPoolBlock{
+struct PixelPoolBlock* next;
+PixelCord pixels[PIXEL_POOL_BLOCK];
+} PixelPoolBlock;
+
+struct PixelPool{
+PixelPoolBlock* first;   // every block this pool has allocated, in order
+PixelPoolBlock* current; // block being handed out from, NULL after a rewind
+size_t used;             // PixelCords already handed out from current
+};
+
+static PixelPool* pixel_pools=NULL;
+static size_t pixel_pools_len=0;
+
 
 
 
@@ -46,6 +66,37 @@ Object* get_current_object(size_t index){
 }
 size_t get_objects_len(){
     return objects_len;
+}
+
+PixelPool* get_pixel_pool(size_t index){
+    return &pixel_pools[index];
+}
+
+// Hand out the next unused PixelCord from this thread's pool, growing the pool
+// by one block when it runs out. NULL only if that allocation fails.
+PixelCord* pixel_pool_take(PixelPool* pool){
+if(pool->current==NULL || pool->used==PIXEL_POOL_BLOCK){
+    PixelPoolBlock* next=pool->current==NULL?pool->first:pool->current->next;
+    if(next==NULL){
+        next=malloc(sizeof(PixelPoolBlock));
+        if(next==NULL)return NULL;
+        next->next=NULL;
+        if(pool->current==NULL)pool->first=next;
+        else pool->current->next=next;
+    }
+    pool->current=next;
+    pool->used=0;
+}
+return &pool->current->pixels[pool->used++];
+}
+
+// Every PixelCord handed out for the previous frame becomes reusable. Only safe
+// once that frame has been shown, which is why render() does it first.
+static void rewind_pixel_pools(){
+for(size_t i=0;i<pixel_pools_len;i++){
+    pixel_pools[i].current=NULL;
+    pixel_pools[i].used=0;
+}
 }
 
 static void setup_camera(){
@@ -81,20 +132,22 @@ static void setup_camera(){
 
 
 static void create_frame_buffer(uint32_t win_w,uint32_t win_h){
-frame1= calloc((win_h*win_w),sizeof(PixelCord));
-frame2= calloc((win_h*win_w),sizeof(PixelCord));
+// a grid of atomic PixelCord pointers. calloc zero-fills, so every cell starts
+// NULL: nothing drawn there yet.
+frame1= calloc((win_h*win_w),sizeof(PixelCord *_Atomic));
+frame2= calloc((win_h*win_w),sizeof(PixelCord *_Atomic));
 frame=frame1;
 }
 
 static void* clear_frame_buffer(void* args ){
-   // resets the frame by clearing all the data in that memory
+   // resets the frame by setting every cell back to NULL
     if(frame!=frame1){
         //reset frame1 memory section
-        memset(frame1,0,(screen_hieght*screen_width)*sizeof(PixelCord));
+        memset(frame1,0,(screen_hieght*screen_width)*sizeof(PixelCord *_Atomic));
     }
     else{
         //reset frame2 memory section
-         memset(frame2,0,(screen_hieght*screen_width)*sizeof(PixelCord));
+         memset(frame2,0,(screen_hieght*screen_width)*sizeof(PixelCord *_Atomic));
     }
 
 }
@@ -124,6 +177,9 @@ void render_init(Object* objs,uint64_t len,uint32_t win_w,uint32_t win_h){
 // needs to be called once to initialise the renderer
 num_core=get_number_of_cores(); // loading the number of core on system to know number of threads to spawn
 num_core=num_core<0?1:num_core-1;
+// one pool per rasterizer: num_core workers plus the main thread
+pixel_pools_len=(size_t)num_core+1;
+pixel_pools=calloc(pixel_pools_len,sizeof(PixelPool));
 create_frame_buffer(win_w,win_h);
 set_objects(objs,len);
 screen_width=win_w;
@@ -136,15 +192,13 @@ bool render(){
 if(frame==NULL)return false;
 if(frame==frame1)frame=frame2;
 else frame=frame1;
+// the frame drawn last time has been shown, so its PixelCords can be reused
+rewind_pixel_pools();
 pthread_t frame_clear_thread;
 if (pthread_create(&frame_clear_thread, NULL,clear_frame_buffer, NULL)) {
             perror("Failed to create thread for memory reset\n");
             return false;
         }
-
-
-
-PixelCord (*frame_buffer)[screen_width]= (PixelCord (*)[screen_width])frame;  
 
 
 for (size_t i = 0; i < objects_len; i++)connector_pool_len+=objects[i].len_of_connectors;
@@ -174,8 +228,9 @@ pthread_t threads[num_core==0?1:num_core]; // Array to hold thread IDs
     }
 
 
-//using main thread too in rasterization process
-rasterization_worker(NULL);   
+//using main thread too in rasterization process. the workers are 0..num_core-1,
+//so the main thread takes index num_core and no two threads share a pool.
+rasterization_worker((void*)(long)num_core);
 
   // 2. Join multiple threads in a separate loop
     // printf("Waiting for threads which are still working to finish to finish...\n");
