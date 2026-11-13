@@ -8,7 +8,7 @@ Design notes for the renderer. Companion to `issues.md` — that file tracks wha
 
 | File | Responsibility |
 | --- | --- |
-| `src/renderer.c` | Renderer state (camera, frame buffers, pixel pools, object list), `render()` dispatch, thread pool lifecycle |
+| `src/renderer.c` | Renderer state (camera, frame buffers, object list), `render()` dispatch, thread pool lifecycle |
 | `src/rasterization.c` | Near-plane clip, projection, scanline triangle fill. The worker body. |
 | `src/wireframe.c` | `bresenhame_line_algo` — walks one segment, emits one `PixelCord` per step with interpolated z and texture coordinates |
 | `src/projection.c` | `perspective_projection` — one axis of the perspective divide |
@@ -35,7 +35,7 @@ Object[] ──▶ render() ──▶ connector_pool  (every object's indices, e
                                         ├─ perspective_projection   world ──▶ pixel
                                         ├─ bresenhame_line_algo x3   one strip per edge
                                         ├─ scanline gather      cursor per edge, monotonic in py
-                                        └─ span fill + depth test ──▶ frame buffer cells (`PixelCord *_Atomic`, compare-exchange)
+                                        └─ span fill + depth test ──▶ frame buffer cells (packed `uint64_t _Atomic`, compare-exchange)
 ```
 
 There is no per-object dispatch. `render()` copies every object's `connectors_sequence` into one flat `connector_pool`, and `obj_end_idx[i]` records the last pool index that belongs to object `i`; a worker finds a triangle's object by walking `obj_end_idx`. Every index is read three at a time as a triangle, so an object with `len_of_connectors == 0` contributes nothing and is not drawn. **Point clouds are no longer rendered.**
@@ -46,13 +46,13 @@ There is no per-object dispatch. `render()` copies every object's `connectors_se
 
 ## 3. API
 
-- `render_init(objs, len, win_w, win_h)` — allocates the frame buffers and one pixel pool per rasterizing thread, records the object array and screen size, derives the camera lens, and caches the worker count. Call once.
+- `render_init(objs, len, win_w, win_h)` — allocates the frame buffers, records the object array and screen size, derives the camera lens, and caches the worker count. Call once.
 - `set_objects(objs, len)` — re-point the renderer at the caller's object array. See §9. Not safe to call concurrently with `render()`.
 - `render()` — swaps to the other frame buffer, clears the one just shown on a helper thread, and draws every object's triangles into the new one (§4, §9). Returns false if the frame buffer is NULL or a thread cannot be created or joined.
 - `renderer_resize(win_w, win_h)` — updates screen size, re-derives the camera, reallocates the frame buffer.
 - `move_camera(unit, direction)` — translates the camera by `unit` world units along one axis. Near value and matching far-plane extent shift together, so the view volume slides rigidly. Does not redraw; the caller calls `render()` afterwards.
 - `get_camera_pos()` — snapshot copy of the `Camera`. Mutating the result does nothing.
-- `get_frame_buffer()` — raw pointer to the grid of `PixelCord *_Atomic` cells being drawn (§9).
+- `get_frame_buffer()` — raw pointer to the grid of packed `uint64_t _Atomic` cells being drawn (§9).
 - `get_current_object()` — the `Object` the worker pool is currently on. Only meaningful between thread spawn and join.
 
 ---
@@ -61,33 +61,35 @@ There is no per-object dispatch. `render()` copies every object's `connectors_se
 
 Work is partitioned **by triangle**, using a shared atomic cursor rather than a precomputed split:
 
-- `render_init` sets `num_core = get_number_of_cores() - 1` (one less, because the main thread also rasterizes) and creates `num_core + 1` pixel pools, one per rasterizing thread.
+- `render_init` sets `num_core = get_number_of_cores() - 1` (one less, because the main thread also rasterizes).
 - `render()` copies every object's indices into one flat `connector_pool`, with `obj_end_idx` marking where each object ends. It spawns `num_core` workers with indices `0 … num_core-1`, runs `rasterization_worker` on the main thread with index `num_core`, then joins. Workers only spawn when `num_core > 1`, so a 2-core machine draws on the main thread alone.
 - Each worker calls `atomic_fetch_add(&triangle_tracker, 3)` to claim the next triangle, so chunks are handed out as 0, 3, 6, … Threads that finish a cheap triangle immediately claim another — self-balancing, which matters because triangle cost varies by orders of magnitude with screen area.
-- A thread's index picks its pixel pool, so no two threads ever hand out the same `PixelCord`.
 - The objects and the frame buffer are published before `pthread_create` and read after `pthread_join`, so those are ordered.
 
 Because triangles are handed out freely, two threads routinely draw the same pixel at the same time. Each depth test is therefore made atomic with a compare-exchange on the cell:
 
 ```c
-PixelCord *existing = atomic_load(cell);
+uint64_t existing = atomic_load(cell);
+float existing_depth = depth_of(existing);   // memcpy of the high 32 bits
 bool is_update_correct = false;
 while (!is_update_correct) {
-    if (!(existing != NULL && existing->z < pixel.z))
-        is_update_correct = store_pixel(cell, pixel, pool, existing);
+    if (!(existing != 0 && existing_depth < pixel.z))
+        is_update_correct = store_pixel(cell, pixel, existing);
     else break;                         // a closer pixel is already there
-    if (!is_update_correct)
+    if (!is_update_correct) {
         existing = atomic_load(cell);   // another thread changed the cell: test again
+        existing_depth = depth_of(existing);
+    }
 }
 ```
 
-`store_pixel` copies the pixel into the thread's pool, then calls `atomic_compare_exchange_strong(cell, &expected, stored)`: the new pointer goes in only if the cell still holds the pixel the depth test was run against. If another thread got there first, the swap fails and the test is re-run against whatever is there now.
+`store_pixel` packs the pixel's depth and colour into one 64-bit word, then calls `atomic_compare_exchange_strong(cell, &expected, stored)`: the new word goes in only if the cell still holds the value the depth test was run against. If another thread got there first, the swap fails and the test is re-run against whatever is there now.
 
-- **Complete pixels only.** The copy is finished before the swap publishes it, and cells are always read with `atomic_load`, so a thread that follows a cell's pointer sees a whole `PixelCord`.
-- **No ABA within a frame.** A published `PixelCord` is never modified, and pool memory is not reused until the next `render()`, so a cell cannot swing back to a pointer a thread has already compared against.
+- **Complete pixels only.** Depth and colour are one word, so a cell is always read and written whole; there is nothing outside the cell to follow.
+- **ABA is harmless.** A cell can only swing back to a value a thread compared against if that exact depth and colour were written again, and the depth test against that value is still the right answer.
 - **Ties are not deterministic.** At equal depth the last successful swap wins, so pixels where two triangles tie (a shared edge, two objects meeting) can differ between runs. Nothing is corrupted; break ties on something stable, such as triangle index, if bit-identical frames matter.
 
-Verified with 1, 3, 4, 6 and 8 threads at `-O0` and `-O2`: every frame identical to the single-threaded frame, and ThreadSanitizer reports no data races.
+Verified with 1, 3, 4, 6 and 8 threads at `-O0` and `-O2`: every frame identical to the single-threaded frame, and ThreadSanitizer reports no data races. Both this and the measurement below were taken on the earlier version whose cells were `PixelCord *_Atomic` pointers; they have not been re-run on packed cells.
 
 Measured against giving each thread its own rows (every thread walks every triangle and writes only rows where `row % threads == index`, with no atomics): compare-exchange is faster at every thread count above 1 — at 8 threads, 48 vs 60 ms on 240 large triangles and 22 vs 91 ms on 20,000 small ones (Debug build). The row split loses because every thread repeats every triangle's setup, which dominates for small triangles.
 
@@ -99,11 +101,11 @@ Measured against giving each thread its own rows (every thread walks every trian
 
 `u` and `v` are the drawn colour; `colour` is not (`issues.md` §9). Both must lie in `[0,1)` — the rasterizer turns them into array subscripts with no bounds check, so `1.0` is one texel past the end. `mesh.h` makes that part of the load contract.
 
-**`PixelCord`** — screen-space position (`px`,`py`), the world-space depth `z` it came from, its texture coordinate, its resolved colour, and a visibility flag. 40 bytes. Serves three roles: a projected vertex, one step along a Bresenham strip, and the stored pixel a frame-buffer cell points at.
+**`PixelCord`** — screen-space position (`px`,`py`), the world-space depth `z` it came from, its texture coordinate, its resolved colour, and a visibility flag. `px`, `py` and `z` are `float`, so the depth fits in a frame-buffer cell's 32 depth bits. Serves three roles: a projected vertex, one step along a Bresenham strip, and the source a frame-buffer cell is packed from.
 
 - `.is_visible` — passed the frustum / screen-bounds test. Pixels failing it are never stored.
 
-Whether a cell has been drawn is not a field: an empty cell is a NULL pointer (§9).
+Whether a cell has been drawn is not a field: an empty cell is 0 (§9).
 
 **`Object`** — `vertices[]` plus a flat `connectors_sequence[]` of indices into it, read three at a time, plus one texture (`texture`, `texture_width`, `texture_height`) shared by every vertex. An object with `len_of_connectors == 0` is not drawn (§2).
 
@@ -185,12 +187,12 @@ Colour is resolved last, per pixel: the span lerp carries `u`/`v`, and `texture[
 
 ## 9. Frame buffer ownership
 
-- Two buffers, `frame1` and `frame2`, each `screen_width * screen_hieght` cells of type `PixelCord *_Atomic`. Allocated by `create_frame_buffer(w,h)` with `calloc`, so every cell starts NULL (an atomic pointer is lock-free and pointer-sized here, so all-zero bytes are NULL). Stored as `void*`; `frame` points at the one being drawn.
-- A cell is NULL (nothing drawn) or points at a `PixelCord` in one of the pixel pools. Each rasterizing thread has its own pool: a linked list of 65,536-`PixelCord` blocks that are never moved, kept across frames and rewound at the start of every `render()`. A pointer therefore stays valid until the next `render()`, by which time its frame has been shown.
-- `render()` swaps `frame` to the other buffer, then a helper thread `memset`s the one just shown back to NULL while the rasterizers draw. That `memset` is the only non-atomic access to the cells; it is safe because no rasterizer touches that buffer.
-- Reinterpreted as `PixelCell (*)[screen_width]` inside `rasterizer()` (`typedef PixelCord *_Atomic PixelCell;` — the `_Atomic(T)` spelling is avoided because VS Code's IntelliSense rejects it), and as a flat `PixelCord *_Atomic *` inside `update_win()`.
+- Two buffers, `frame1` and `frame2`, each `screen_width * screen_hieght` cells of type `uint64_t _Atomic`. Allocated by `create_frame_buffer(w,h)` with `calloc`, so every cell starts 0 (a 64-bit atomic is lock-free and plain-sized here, so all-zero bytes are 0). Stored as `void*`; `frame` points at the one being drawn.
+- A cell packs one pixel by value: the high 32 bits are the bit pattern of its `float` depth, the low 32 bits its ARGB colour. 0 means nothing has been drawn. The depth is read back with a `memcpy` of the high half into a `float` — a cast would convert the integer instead of reinterpreting the bits.
+- `render()` swaps `frame` to the other buffer, then a helper thread `memset`s the one just shown back to 0 while the rasterizers draw. That `memset` is the only non-atomic access to the cells; it is safe because no rasterizer touches that buffer.
+- Reinterpreted as `_Atomic uint64_t (*)[screen_width]` inside `rasterizer()` (the `_Atomic(T)` spelling is avoided because VS Code's IntelliSense rejects it), and as a flat `uint64_t _Atomic *` inside `update_win()`.
 - Depth arbitration is the load / compare / compare-exchange loop in §4. There is no separate depth array.
-- `update_win` flattens it to ARGB: a non-NULL cell paints its pixel's colour, composited over the background by its alpha; a NULL cell paints white.
+- `update_win` flattens it to ARGB: a non-zero cell paints the colour in its low 32 bits, composited over the background by its alpha; a zero cell paints white.
 - `Object.vertices`, `Object.connectors_sequence` and `Object.texture` are owned by whoever created the `Object`; the renderer never frees them.
 
 ### Scene list
@@ -241,7 +243,7 @@ Every loader emits a **triangle list**, because `render()` infers the primitive 
 
 Ownership matches the scene-array rule in §9: the loader `malloc`s `vertices`, `connectors_sequence` and `texture`, the caller releases all three with `mesh_free`, and the renderer only reads.
 
-`mesh_fit_to_view` is separate from parsing on purpose. Loaders return the model in its own units and origin; the fit pass rescales the longest axis to a target extent, recentres, and mirrors y (glTF and OBJ are +y up, this renderer is +y down). Without it a model is either a speck or swallows the screen, since the camera is a fixed pinhole at the world origin.
+`mesh_model_fit` is separate from parsing on purpose. Loaders return the model in its own units and origin; the fit pass takes one bounding box across every object in the Model, rescales the longest axis to a target extent, recentres, and mirrors y (glTF and OBJ are +y up, this renderer is +y down). Without it a model is either a speck or swallows the screen, since the camera is a fixed pinhole at the world origin.
 
 What the loaders deliberately refuse rather than approximate: glTF sparse accessors, morph targets, skinned meshes, any `extensionsRequired` entry, Draco and meshopt compression, and any primitive mode other than TRIANGLES. Each of those would otherwise return geometry that is silently the wrong shape.
 

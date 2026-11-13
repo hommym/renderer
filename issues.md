@@ -8,7 +8,7 @@ Open problems in the renderer. Each entry: what breaks, why it breaks, fix direc
 
 **What breaks.** Undefined behaviour on every worker exit.
 
-**Why.** `rasterization.c:391` declares `void* rasterization_worker(void* args)` and the function body ends after the `while` loop with no `return`. Reaching the closing brace of a non-`void` function and having the caller use the value is UB. `pthread_join` is passed `NULL` for the result today, so nothing reads it and it does not misbehave in practice.
+**Why.** `rasterization.c:393` declares `void* rasterization_worker(void* args)` and the function body ends after the `while` loop with no `return`. Reaching the closing brace of a non-`void` function and having the caller use the value is UB. `pthread_join` is passed `NULL` for the result today, so nothing reads it and it does not misbehave in practice.
 
 **Fix path.** `return NULL;` at the end.
 
@@ -69,15 +69,15 @@ So it is real but currently invisible: half the pixels of the forest land on a *
 
 **What breaks.** If memory runs out while allocating, the renderer crashes instead of failing cleanly.
 
-**Why.** `create_frame_buffer` never checks its two `calloc` results, and `render_init` does not check the pixel-pool `calloc` either. `render()` tests `frame == NULL` only *before* swapping buffers, so a failed `frame2` is swapped in and drawn into anyway. `update_win()` never checks its buffer at all, and both callers (`main.c` and the event loop in `win_i_o.c`) ignore `render()`'s return value.
+**Why.** `create_frame_buffer` never checks its two `calloc` results. `render()` tests `frame == NULL` only *before* swapping buffers, so a failed `frame2` is swapped in and drawn into anyway. `update_win()` never checks its buffer at all, and both callers (`main.c` and the event loop in `win_i_o.c`) ignore `render()`'s return value.
 
-**Fix path.** Check all three allocations and have `render_init` report failure (it returns `void` today). Test the buffer after the swap in `render()`, and only call `update_win()` when `render()` returned true.
+**Fix path.** Check both allocations and have `render_init` report failure (it returns `void` today). Test the buffer after the swap in `render()`, and only call `update_win()` when `render()` returned true.
 
 ---
 
 ## 8. The rasterizer indexes the texture with no bounds check
 
-**What breaks.** `rasterization.c:343-344` and `:367-368` compute
+**What breaks.** `rasterization.c:334-335` and `:365-366` compute
 
 ```c
 size_t f_row=(size_t)(obj->texture_height*fill_pixel.v);
@@ -99,7 +99,7 @@ A hand-built `Object` (the cube in `main.c`) is not covered by any of that; its 
 
 **What breaks.** A mesh whose colour lives per vertex and not in an image — PLY `red/green/blue`, glTF `COLOR_0`, the non-standard OBJ `v x y z r g b` — renders as one flat colour.
 
-**Why.** The rasterizer overwrites every pixel's colour with a texture sample (`rasterization.c:346`, `:369`) rather than using the interpolated `current.colour`. The loaders still fill `Vectex.colour`, and the flat fallback texture is built from it (PLY averages every vertex colour into its 1x1 texture), so the model gets its overall tone but none of its variation.
+**Why.** The rasterizer overwrites every pixel's colour with a texture sample (`rasterization.c:337`, `:367`) rather than using the interpolated `current.colour`. The loaders still fill `Vectex.colour`, and the flat fallback texture is built from it (PLY averages every vertex colour into its 1x1 texture), so the model gets its overall tone but none of its variation.
 
 There is no way to fix this in the loader: a texture lookup cannot reproduce per-vertex colour, because interpolating `u,v` across a triangle sweeps a rectangle of unrelated texels rather than blending three corner colours.
 
