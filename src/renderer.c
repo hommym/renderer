@@ -91,11 +91,11 @@ static void* clear_frame_buffer(void* args ){
    // resets the frame by setting every cell back to NULL
     if(frame!=frame1){
         //reset frame1 memory section
-        memset(frame1,0,(screen_hieght*screen_width)*sizeof(PixelCord *_Atomic));
+        memset(frame1,0,(screen_hieght*screen_width)*sizeof(uint64_t));
     }
     else{
         //reset frame2 memory section
-         memset(frame2,0,(screen_hieght*screen_width)*sizeof(PixelCord *_Atomic));
+         memset(frame2,0,(screen_hieght*screen_width)*sizeof(uint64_t));
     }
 
 }
