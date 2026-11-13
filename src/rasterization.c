@@ -122,7 +122,7 @@ static bool store_pixel(uint64_t _Atomic *cell, PixelCord px, uint64_t expected)
 {
     uint64_t stored=0;
     uint64_t z=0;
-    memcpy(&z,&px.z,sizeof(z));
+    memcpy(&z,&px.z,sizeof(float));
     z=z<<32;
     stored=stored ^ z;
     stored=stored ^ ((uint64_t)px.colour);
