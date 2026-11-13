@@ -275,17 +275,6 @@ static bool inf_setup(Inf* z,const void* src,size_t src_len,void* dst,size_t dst
     return true;
 }
 
-bool inflate_raw(const void* src,size_t src_len,void* dst,size_t dst_cap,size_t* out_len,
-                 char* err,size_t err_len){
-    if(out_len)*out_len=0;
-    if(err&&err_len)err[0]='\0';
-    Inf z;
-    if(!inf_setup(&z,src,src_len,dst,dst_cap,err,err_len))return false;
-    if(!inflate_core(&z))return false;
-    if(out_len)*out_len=z.out;
-    return true;
-}
-
 // ---- zlib wrapper --------------------------------------------------------
 
 static uint32_t adler32(const uint8_t* d,size_t n){

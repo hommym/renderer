@@ -22,10 +22,4 @@ bool inflate_zlib(const void* src, size_t src_len,
                   void* dst, size_t dst_cap, size_t* out_len,
                   char* err, size_t err_len);
 
-// Raw DEFLATE with no zlib header or trailer, for callers that have already
-// stripped the framing.
-bool inflate_raw(const void* src, size_t src_len,
-                 void* dst, size_t dst_cap, size_t* out_len,
-                 char* err, size_t err_len);
-
 #endif

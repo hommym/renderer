@@ -321,21 +321,6 @@ for(uint64_t i=0;i<o->len_of_vertices;i++){
 }
 }
 
-bool mesh_fit_to_view(Object* obj,double target_extent,
-                      double cx,double cy,double cz,bool flip_y){
-if(!obj||!obj->vertices||obj->len_of_vertices==0)return false;
-// a non-finite target or centre would turn every vertex into NaN, which the
-// projection then silently drops. Refuse instead of quietly emptying the mesh.
-if(!isfinite(target_extent)||!isfinite(cx)||!isfinite(cy)||!isfinite(cz))return false;
-
-double mn[3]={0,0,0},mx[3]={0,0,0},mid[3],scale;
-uint64_t seen=0;
-bbox_fold(obj,mn,mx,&seen);
-if(!fit_params(mn,mx,seen,target_extent,&scale,mid))return false;
-apply_fit(obj,scale,mid,cx,cy,cz,flip_y);
-return true;
-}
-
 bool mesh_model_fit(Model* s,double target_extent,
                             double cx,double cy,double cz,bool flip_y){
 if(!s||!s->objects||s->len==0)return false;

@@ -36,6 +36,4 @@ bool image_decode_file(const char* path, uint32_t max_dim,
 // gets one of these rather than a NULL pointer.
 bool image_solid(uint32_t argb, Image* out);
 
-void image_free(Image* img);
-
 #endif

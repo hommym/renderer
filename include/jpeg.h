@@ -35,10 +35,6 @@ typedef struct JpegImage {
 bool jpeg_decode(const void* data, size_t len, uint32_t max_dim,
                  JpegImage* out, char* err, size_t err_len);
 
-// Frees the pixel buffer and zeroes the struct. Safe on NULL and on an already
-// freed or zeroed image.
-void jpeg_free(JpegImage* img);
-
 // True when data[0..len) opens with the JPEG SOI marker.
 bool jpeg_is_jpeg(const void* data, size_t len);
 

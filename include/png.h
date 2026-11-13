@@ -25,20 +25,4 @@ typedef struct PngImage {
 // into err when err is non-NULL.
 bool png_decode(const void* data, size_t len, PngImage* out, char* err, size_t err_len);
 
-// Frees the pixel buffer and zeroes the struct. Safe on NULL and on an already
-// freed or zeroed image.
-void png_free(PngImage* img);
-
-// Bilinear sample at normalised coordinates. u,v are glTF TEXCOORD values: the
-// origin is the TOP-LEFT and v runs downward, matching PNG row order, so no flip
-// is applied here. Out-of-range coordinates are wrapped or clamped per `wrap`.
-// Returns 0xAARRGGBB. A NULL or empty image returns `fallback`.
-typedef enum PngWrap {
-    PNG_WRAP_REPEAT = 0,
-    PNG_WRAP_CLAMP,
-    PNG_WRAP_MIRROR
-} PngWrap;
-
-uint32_t png_sample(const PngImage* img, double u, double v, PngWrap wrap, uint32_t fallback);
-
 #endif

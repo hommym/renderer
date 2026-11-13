@@ -144,7 +144,8 @@ void mesh_free(Object* obj);
 // they almost always are.
 MeshResult mesh_load_scene(const char* path, Model* out);
 
-// mesh_fit_to_view over the whole Model at once. Fitting each object separately
+// Rescales the whole Model so its longest axis is target_extent world units and
+// recentres it on (cx, cy, cz). Fitting each object separately
 // would scale every material's share to the same size and pile them on top of
 // each other, so the bounding box has to be taken across all of them and the one
 // resulting transform applied to all of them.
@@ -177,17 +178,5 @@ char* mesh_path_sibling(const char* base_path, const char* rel);
 // with no usable image gets, so that the rasterizer always has something to
 // sample. Returns false only on allocation failure.
 bool mesh_set_flat_texture(Object* obj, uint32_t argb);
-
-// Model files are in their own units and origin; this camera is a fixed pinhole
-// at the world origin looking down +z. Rescales the mesh so its longest axis is
-// target_extent world units and recentres it on (cx, cy, cz).
-//
-// flip_y mirrors the y axis, which glTF and OBJ both need: they are +y up, this
-// renderer is +y down. Texture coordinates are untouched -- v already points the
-// way the renderer indexes rows.
-//
-// Returns false and leaves obj untouched if it has no vertices or zero extent.
-bool mesh_fit_to_view(Object* obj, double target_extent,
-                      double cx, double cy, double cz, bool flip_y);
 
 #endif

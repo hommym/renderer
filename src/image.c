@@ -132,9 +132,3 @@ bool image_solid(uint32_t argb,Image* out){
     out->pixels=p;out->width=1;out->height=1;
     return true;
 }
-
-void image_free(Image* img){
-    if(!img)return;
-    free(img->pixels);
-    img->pixels=NULL;img->width=0;img->height=0;
-}

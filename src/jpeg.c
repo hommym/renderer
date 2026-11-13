@@ -573,12 +573,6 @@ bool jpeg_is_jpeg(const void* data,size_t len){
     return d&&len>=2&&d[0]==0xFF&&d[1]==0xD8;
 }
 
-void jpeg_free(JpegImage* img){
-    if(!img)return;
-    free(img->rgba);
-    img->rgba=NULL;img->width=0;img->height=0;
-}
-
 bool jpeg_decode(const void* data,size_t len,uint32_t max_dim,
                  JpegImage* out,char* err,size_t err_len){
     if(!out)return false;
