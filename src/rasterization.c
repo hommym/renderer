@@ -12,10 +12,6 @@
 // geometry projects inverted instead of disappearing.
 #define NEAR_PLANE_MARGIN 1.0
 
-static pthread_mutex_t condition_lock = PTHREAD_MUTEX_INITIALIZER;
-
-static _Atomic bool is_obj_upd = false;
-
 // Walk t of the way from a to b, in world space and in colour.
 static Vectex lerp_vectex(Vectex a, Vectex b, double t)
 {
@@ -134,7 +130,7 @@ static bool store_pixel(uint64_t _Atomic *cell, PixelCord px, uint64_t expected)
     return atomic_compare_exchange_strong(cell, &expected, stored);
 }
 
-static void rasterizer(Vectex source_triangle[3], Object *obj, PixelPool *pool)
+static void rasterizer(Vectex source_triangle[3], Object *obj)
 {
     _Atomic uint64_t (*frame_buffer)[screen_width] = ( _Atomic uint64_t (*)[screen_width])get_frame_buffer();
     size_t w = (*obj).texture_width;
@@ -396,8 +392,7 @@ static void rasterizer(Vectex source_triangle[3], Object *obj, PixelPool *pool)
 
 void *rasterization_worker(void *args)
 {
-    // render() hands every rasterizer thread its own index, which picks its pool
-    PixelPool *pool = get_pixel_pool((size_t)args);
+    (void)args; // render() passes each thread's index; nothing reads it yet
     size_t obj_end_idx_tracker = 0;
     size_t current_triangle_pointer = atomic_fetch_add(&triangle_tracker, 3);
     Object obj;
@@ -417,7 +412,7 @@ void *rasterization_worker(void *args)
         Vectex triangle[3] = {obj.vertices[connector_pool[current_triangle_pointer++]],
                               obj.vertices[connector_pool[current_triangle_pointer++]],
                               obj.vertices[connector_pool[current_triangle_pointer]]};
-        rasterizer(triangle, &obj, pool);
+        rasterizer(triangle, &obj);
         current_triangle_pointer = atomic_fetch_add(&triangle_tracker, 3);
     }
 }
