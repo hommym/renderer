@@ -4,6 +4,7 @@
 #include "wireframe.h"
 #include "utils.h"
 #include "interpolation.h"
+#include "math.h"
 
 // How far in front of the camera the near plane sits, in world units. The
 // perspective divide is only meaningful in front of the camera: at depth 0 it
@@ -119,31 +120,23 @@ bool is_vectex_visible(Vectex point, PixelCord *pxcord_p)
     return (*pxcord_p).is_visible;
 }
 
-// One frame-buffer cell: an atomic pointer to the PixelCord drawn there, NULL
-// where nothing has been drawn. Named so the frame buffer's declaration never
-// spells `_Atomic(`, which VS Code's IntelliSense does not accept.
-typedef PixelCord *_Atomic PixelCell;
-
-// Point a frame-buffer cell at a copy of px. px is a local that dies with its
-// loop iteration, so the cell can't point at it; the copy lives in this
-// thread's pool until the next render(). If the pool can't grow, the pixel is
-// simply not drawn. The copy is finished before the atomic store publishes it,
-// so a thread that loads the cell always sees a complete PixelCord.
-static bool store_pixel(PixelCord *_Atomic *cell, PixelCord px, PixelPool *pool, PixelCord *expected)
+// Pack px into one 64-bit cell (depth bits high, colour low) and publish it,
+// but only if the cell still holds `expected`.
+static bool store_pixel(uint64_t _Atomic *cell, PixelCord px, uint64_t expected)
 {
-    PixelCord *stored = pixel_pool_take(pool);
-    if (stored == NULL){
-        printf("Out of memory");
-        abort();
-
-    }
-    *stored = px;
+    uint64_t stored=0;
+    uint64_t z=0;
+    memcpy(&z,&px.z,sizeof(z));
+    z=z<<32;
+    stored=stored ^ z;
+    stored=stored ^ ((uint64_t)px.colour);
+    
     return atomic_compare_exchange_strong(cell, &expected, stored);
 }
 
 static void rasterizer(Vectex source_triangle[3], Object *obj, PixelPool *pool)
 {
-    PixelCell(*frame_buffer)[screen_width] = (PixelCell(*)[screen_width])get_frame_buffer();
+    _Atomic uint64_t (*frame_buffer)[screen_width] = ( _Atomic uint64_t (*)[screen_width])get_frame_buffer();
     size_t w = (*obj).texture_width;
 
     uint32_t (*texture)[w] = (uint32_t (*)[w])(*obj).texture;
@@ -338,7 +331,10 @@ static void rasterizer(Vectex source_triangle[3], Object *obj, PixelPool *pool)
                             if (!fill_pixel.is_visible)
                                 continue;
 
-                            PixelCord *existing = atomic_load(&frame_buffer[(uint64_t)fill_pixel.py][(uint64_t)fill_pixel.px]);
+                            uint64_t existing = atomic_load(&frame_buffer[(uint64_t)fill_pixel.py][(uint64_t)fill_pixel.px]);
+                            uint32_t wrong_data=(uint32_t)(existing>>32);
+                            float existing_depth=0.0f;
+                            memcpy(&existing_depth,&wrong_data,sizeof(wrong_data));
                             size_t f_row = (size_t)((*obj).texture_height * fill_pixel.v);
                             size_t f_col = (size_t)((*obj).texture_width * fill_pixel.u);
 
@@ -348,12 +344,15 @@ static void rasterizer(Vectex source_triangle[3], Object *obj, PixelPool *pool)
                             bool is_update_correct = false;
                             while (!is_update_correct)
                             {
-                                if (!(existing != NULL && existing->z < fill_pixel.z))
-                                    is_update_correct = store_pixel(&frame_buffer[(uint64_t)fill_pixel.py][(uint64_t)fill_pixel.px], fill_pixel, pool, existing);
+                                if (!(existing != 0 && existing_depth < fill_pixel.z))
+                                    is_update_correct = store_pixel(&frame_buffer[(uint64_t)fill_pixel.py][(uint64_t)fill_pixel.px], fill_pixel, existing);
 
                                 else break;    
-                                if (!is_update_correct)
+                                if (!is_update_correct){
                                     existing = atomic_load(&frame_buffer[(uint64_t)fill_pixel.py][(uint64_t)fill_pixel.px]);
+                                    wrong_data=(uint32_t)(existing>>32);
+                                    memcpy(&existing_depth,&wrong_data,sizeof(wrong_data));
+                                }
                             }
                         }
                     }
@@ -362,7 +361,11 @@ static void rasterizer(Vectex source_triangle[3], Object *obj, PixelPool *pool)
                 if (!current.is_visible)
                     continue;
 
-                PixelCord *existing = atomic_load(&frame_buffer[(uint64_t)current.py][(uint64_t)current.px]);
+                uint64_t existing = atomic_load(&frame_buffer[(uint64_t)current.py][(uint64_t)current.px]);
+                uint32_t wrong_data=(uint32_t)(existing>>32);
+                float existing_depth=0.0f;
+                memcpy(&existing_depth,&wrong_data,sizeof(wrong_data));
+                
                 size_t c_row = (size_t)((*obj).texture_height * current.v);
                 size_t c_col = (size_t)((*obj).texture_width * current.u);
                 current.colour = texture[c_row][c_col];
@@ -371,12 +374,16 @@ static void rasterizer(Vectex source_triangle[3], Object *obj, PixelPool *pool)
                 bool is_update_correct = false;
                 while (!is_update_correct)
                 {
-                    if (!(existing != NULL && existing->z < current.z))
-                        is_update_correct = store_pixel(&frame_buffer[(uint64_t)current.py][(uint64_t)current.px], current, pool, existing);
+                    if (!(existing != 0 && existing_depth < current.z))
+                        is_update_correct = store_pixel(&frame_buffer[(uint64_t)current.py][(uint64_t)current.px], current, existing);
 
                     else break;    
-                    if (!is_update_correct)
+                    if (!is_update_correct){
                         existing = atomic_load(&frame_buffer[(uint64_t)current.py][(uint64_t)current.px]);
+                          wrong_data=(uint32_t)(existing>>32);
+                          memcpy(&existing_depth,&wrong_data,sizeof(wrong_data));
+
+                    }
                 }
             }
         }

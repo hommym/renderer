@@ -156,7 +156,7 @@ uint32_t b=((argb&0xFFu)*a+bb*ia+127u)/255u;
 return 0xFF000000u|(r<<16)|(g<<8)|b;
 }
 
-void update_win(PixelCord *_Atomic *frame_buffer){
+void update_win(uint64_t _Atomic *frame_buffer){
 if(win==NULL){
     printf("No window to update\n");
     return;
@@ -196,13 +196,14 @@ if(pixel_buffer==NULL || pb_w!=w || pb_h!=h){
 }
 
 // flatten the frame buffer into ARGB pixels for SDL.
-// empty cells (NULL: never written by render()) paint as the background;
+// each cell packs depth in the high 32 bits and ARGB colour in the low 32.
+// empty cells (0: never written by render()) paint as the background;
 // occupied cells are composited over it by their own alpha.
 size_t total=(size_t)w*(size_t)h;
 for(size_t i=0;i<total;i++){
-    PixelCord* cell=atomic_load(&frame_buffer[i]);
-    pixel_buffer[i]=cell!=NULL ? blend_over_background(cell->colour)
-                               : BACKGROUND_ARGB;
+    uint64_t cell=atomic_load(&frame_buffer[i]);
+    pixel_buffer[i]=cell!=0 ? blend_over_background((uint32_t)cell)
+                            : BACKGROUND_ARGB;
 }
 
 SDL_UpdateTexture(sdl_texture,NULL,pixel_buffer,w*(int)sizeof(uint32_t));

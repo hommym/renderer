@@ -97,7 +97,7 @@ int cores=get_number_of_cores();
 printf("cores: %d\n",cores);
 render_init(scene,scene_len,(uint32_t)w,(uint32_t)h);
 render();
-update_win((PixelCord *_Atomic *)get_frame_buffer());
+update_win(get_frame_buffer());
 set_up_event_handler();
 free(scene);
 // releases every object's arrays and every distinct texture. never mesh_free an

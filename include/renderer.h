@@ -54,9 +54,9 @@ typedef struct Object
 
 
 typedef struct PixelCord{
-double px;  
-double py;
-double z;
+float px;  
+float py;
+float z;
 bool is_visible;
 float  u;
 float  v;

@@ -134,8 +134,8 @@ static void setup_camera(){
 static void create_frame_buffer(uint32_t win_w,uint32_t win_h){
 // a grid of atomic PixelCord pointers. calloc zero-fills, so every cell starts
 // NULL: nothing drawn there yet.
-frame1= calloc((win_h*win_w),sizeof(PixelCord *_Atomic));
-frame2= calloc((win_h*win_w),sizeof(PixelCord *_Atomic));
+frame1= calloc((win_h*win_w),sizeof(uint64_t _Atomic));
+frame2= calloc((win_h*win_w),sizeof(uint64_t _Atomic));
 frame=frame1;
 }
 
